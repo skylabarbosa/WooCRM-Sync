@@ -1,0 +1,5 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+body { margin: 0; background: #f7f8fc; color: #172033; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+button { transition: all .15s ease; }
