@@ -210,6 +210,33 @@ def test_demo_reset_is_idempotent_without_duplicate_default_records():
         ).fetchall() == []
 
 
+def test_demo_reconciliation_backfills_missing_contact_outcomes_without_resetting_orders():
+    reset()
+    with db() as connection:
+        before_orders = connection.execute(
+            "SELECT id,customer_email,status FROM orders WHERE dataset='default' ORDER BY id"
+        ).fetchall()
+        connection.execute("DELETE FROM crm_contacts WHERE dataset='default'")
+
+    main.run_sync("default")
+
+    with db() as connection:
+        after_orders = connection.execute(
+            "SELECT id,customer_email,status FROM orders WHERE dataset='default' ORDER BY id"
+        ).fetchall()
+        statuses = dict(connection.execute(
+            "SELECT email,status FROM crm_contacts WHERE dataset='default'"
+        ).fetchall())
+    assert after_orders == before_orders
+    assert sum(status == "FOUND" for status in statuses.values()) == 4
+    assert sum(status == "NOT_FOUND" for status in statuses.values()) == 2
+    assert len(statuses) == 6
+    payload = dashboard()
+    assert payload["contact_counts"]["FOUND"] == 4
+    assert payload["contact_counts"]["NOT_FOUND"] == 2
+    assert payload["contact_counts"]["NOT_CHECKED"] == 12
+
+
 def test_arbitrary_order_import_reconcile_replay_and_idempotency():
     reset()
     dataset = f"imp-{uuid4().hex}"

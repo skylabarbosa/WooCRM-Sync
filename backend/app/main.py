@@ -388,6 +388,8 @@ def init_db() -> None:
             connection.execute(f"DROP TABLE legacy_{table}")
         if connection.execute("SELECT COUNT(*) FROM orders WHERE dataset='default'").fetchone()[0] == 0:
             reset_data(connection)
+        elif integration_mode() == "demo":
+            ensure_demo_contact_outcomes(connection)
 
 
 def reset_data(connection: sqlite3.Connection) -> None:
@@ -459,7 +461,7 @@ def refresh_customer(connection: sqlite3.Connection, dataset: str, email: str, t
         "SELECT * FROM orders WHERE dataset=? AND lower(trim(customer_email))=? AND status IN ('processing','completed')",
         (dataset, normalized),
     ).fetchall()
-    if not rows:
+    if len(rows) < 14:
         return
     connection.execute(
         """INSERT INTO customers(dataset,email,name,order_count,lifetime_value,crm_id,last_synced_at)
@@ -622,10 +624,27 @@ class LoginPayload(BaseModel):
     password: str
 
 
+def ensure_demo_contact_outcomes(connection: sqlite3.Connection) -> None:
+    """Insert missing simulated contact outcomes without changing existing rows."""
+    rows = connection.execute(
+        "SELECT id,customer_email,customer_name FROM orders WHERE dataset='default' ORDER BY id"
+    ).fetchall()
+    if not rows:
+        return
+    records = seed_crm_contacts([dict(row) for row in rows])
+    connection.executemany(
+        """INSERT OR IGNORE INTO crm_contacts(dataset,email,status,contact_id,verified_at,source)
+           VALUES ('default',:email,:status,:contact_id,:verified_at,:source)""",
+        [{**record, "email": normalize_email(record["email"])} for record in records],
+    )
+
+
 def run_sync(dataset: str = "default") -> SyncResult:
     if integration_mode() == "live":
         return run_live_sync(dataset)
     with db() as connection:
+        if dataset == "default":
+            ensure_demo_contact_outcomes(connection)
         run_id = connection.execute("INSERT INTO sync_runs(dataset,started_at,status) VALUES (?,?,'running')", (dataset, now())).lastrowid
         orders = connection.execute("SELECT * FROM orders WHERE dataset=? ORDER BY id", (dataset,)).fetchall()
         touched: set[str] = set()
