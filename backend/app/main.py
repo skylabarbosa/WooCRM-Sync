@@ -1266,20 +1266,24 @@ def live_write_action(order_id: str, dataset: str, event_type: str, approval_id:
         if state not in allowed:
             reason = f"{action_label} is only allowed for {', '.join(sorted(allowed))}; current state is {state}"
             record_event(connection, dataset, order_id, event_type, "blocked", f"{action_label} was not run.", error_message=reason)
+            connection.commit()
             raise HTTPException(409, reason)
         if order["environment"] != "live" or order["source"] != "woocommerce":
             reason = "Live CRM writes are restricted to orders fetched from WooCommerce in live mode"
             record_event(connection, dataset, order_id, event_type, "blocked", f"{action_label} was not run.", error_message=reason)
+            connection.commit()
             raise HTTPException(409, reason)
 
         status = connector_status()
         if not status["configured"] or not status.get("field_mapping_configured", False):
             reason = "Live CRM writes are blocked until connector configuration and field mapping are verified"
             record_event(connection, dataset, order_id, event_type, "blocked", f"{action_label} was not run.", error_message=reason)
+            connection.commit()
             raise HTTPException(409, reason)
         if not writes_enabled():
             reason = "Live CRM writes are disabled; set CRM_WRITE_ENABLED=true only after verification"
             record_event(connection, dataset, order_id, event_type, "blocked", f"{action_label} was not run.", error_message=reason)
+            connection.commit()
             raise HTTPException(409, reason)
 
         before = compared_values(order, crm)
@@ -1344,6 +1348,7 @@ def live_write_action(order_id: str, dataset: str, event_type: str, approval_id:
                  order["total"], order["currency"], message, checked, checked),
             )
             record_event(connection, dataset, order_id, event_type, "failed", f"{action_label} was not verified.", error_message=message)
+            connection.commit()
             if isinstance(exc, ConnectorError):
                 raise connector_failure(exc, f"live {event_type}") from exc
             raise HTTPException(502, f"{action_label} failed: {message}") from exc

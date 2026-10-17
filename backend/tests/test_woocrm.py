@@ -705,6 +705,48 @@ def test_live_replay_writes_then_reconciles_with_mocked_connectors(monkeypatch):
     ).status_code == 422
 
 
+def test_live_write_failure_persists_error_and_audit_records(monkeypatch):
+    reset()
+    monkeypatch.setenv("INTEGRATION_MODE", "live")
+    monkeypatch.setenv("CRM_PROVIDER", "hubspot")
+    monkeypatch.setenv("CRM_WRITE_ENABLED", "true")
+    monkeypatch.setenv("WOOCOMMERCE_STORE_URL", "https://shop.example")
+    monkeypatch.setenv("WOOCOMMERCE_CONSUMER_KEY", "key")
+    monkeypatch.setenv("WOOCOMMERCE_CONSUMER_SECRET", "secret")
+    monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", "token")
+
+    class FakeWoo:
+        def list_orders(self):
+            return [NormalizedOrder("live-failure", "failure@example.com", "Failure", 12, "USD", "processing", "2026-10-14T10:00:00Z")]
+
+        def test_connection(self):
+            return None
+
+    class FailingCRM:
+        def test_connection(self):
+            return None
+
+        def find_order(self, external_order_id):
+            return None
+
+        def write_order(self, order, existing=None):
+            raise ConnectorError("HubSpot", "simulated write failure", retryable=True)
+
+    monkeypatch.setattr(main, "WooCommerceClient", FakeWoo)
+    monkeypatch.setattr(main, "HubSpotCRMAdapter", FailingCRM)
+    assert client.post("/api/woocrm/reconcile").status_code == 200
+
+    response = client.post("/api/woocrm/orders/live-failure/replay")
+    assert response.status_code == 502
+    snapshot = client.get("/api/woocrm/dashboard").json()
+    failed_order = next(order for order in snapshot["orders"] if order["id"] == "live-failure")
+    assert failed_order["state"] == "ERROR"
+    assert failed_order["crm"]["error_message"] == "HubSpot: simulated write failure"
+    event = client.get("/api/woocrm/orders/live-failure/history").json()["events"][0]
+    assert event["outcome"] == "failed"
+    assert event["error_message"] == "HubSpot: simulated write failure"
+
+
 def test_reconciliation_does_not_repair_missing_records():
     dataset = f"rec-{uuid4().hex}"
     order = {
