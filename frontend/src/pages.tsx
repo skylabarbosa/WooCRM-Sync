@@ -29,9 +29,9 @@ type PageProps = {
   onNavigate: (path: string) => void;
 };
 
-/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+/* ===========================================================
    Dashboard Page
-â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
+=========================================================== */
 export function DashboardPage({ data, refresh, busy, setBusy, notify, onNavigate }: PageProps) {
   const [selected, setSelected] = useState<Order | null>(null);
   const [pendingAction, setPendingAction] = useState<{ order: Order; kind: "replay" | "update" } | null>(null);
@@ -88,7 +88,7 @@ export function DashboardPage({ data, refresh, busy, setBusy, notify, onNavigate
         </ConfirmDialog>
       )}
 
-      {/* â”€â”€ Page heading â”€â”€ */}
+      {/* -- Page heading -- */}
       <div className="page-heading">
         <div>
           <h2>Dashboard</h2>
@@ -97,7 +97,7 @@ export function DashboardPage({ data, refresh, busy, setBusy, notify, onNavigate
         </div>
       </div>
 
-      {/* â”€â”€ Metric cards â”€â”€ */}
+      {/* -- Metric cards -- */}
       <section className="metric-grid">
         <MetricCard label="Eligible orders" value={eligible}         detail={`${data.orders.length} total in snapshot`} tone="eligible" onClick={() => onNavigate("/woocrm/orders")} />
         <MetricCard label="Synced"          value={counts.SYNCED}    detail="Verified records"       tone="synced"   onClick={() => onNavigate("/woocrm/orders")} />
@@ -106,7 +106,7 @@ export function DashboardPage({ data, refresh, busy, setBusy, notify, onNavigate
         <MetricCard label="Errors"          value={counts.ERROR}     detail="Recoverable failures"   tone="error"    onClick={() => onNavigate("/woocrm/orders")} />
       </section>
 
-      {/* â”€â”€ Attention alert â”€â”€ */}
+      {/* -- Attention alert -- */}
       {attention.length > 0 && (
         <div className="alert-banner">
           <div className="alert-banner-left">
@@ -128,7 +128,7 @@ export function DashboardPage({ data, refresh, busy, setBusy, notify, onNavigate
         </div>
       )}
 
-      {/* â”€â”€ Three-column grid â”€â”€ */}
+      {/* -- Three-column grid -- */}
       <div className="dash-three-col">
 
         {/* Sync Summary */}
@@ -180,7 +180,7 @@ export function DashboardPage({ data, refresh, busy, setBusy, notify, onNavigate
         <section className="surface activity-card">
           <div className="section-heading">
             <div>
-              <span className="eyebrow">Recent activity</span>
+              <span className="eyebrow">Recent activity (derived from the last run)</span>
               <h3>Latest synchronization events.</h3>
             </div>
           </div>
@@ -250,7 +250,7 @@ export function DashboardPage({ data, refresh, busy, setBusy, notify, onNavigate
         </section>
       </div>
 
-      {/* â”€â”€ Recent Orders â”€â”€ */}
+      {/* -- Recent Orders -- */}
       <section className="surface" style={{ marginTop: 16 }}>
         <div className="section-heading">
           <div>
@@ -277,9 +277,9 @@ export function DashboardPage({ data, refresh, busy, setBusy, notify, onNavigate
   );
 }
 
-/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+/* ===========================================================
    Orders Page
-â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
+=========================================================== */
 export function OrdersPage({ data, refresh, busy, setBusy, notify }: PageProps) {
   const params = new URLSearchParams(window.location.search);
   const [query, setQuery] = useState(params.get("search") || "");
@@ -329,7 +329,7 @@ export function OrdersPage({ data, refresh, busy, setBusy, notify }: PageProps) 
   const runAction = async (order: Order, kind: "replay" | "update") => {
     setBusy(true);
     try {
-      notify(kind === "replay" ? "Processing replayâ€¦" : "Processing CRM updateâ€¦");
+      notify(kind === "replay" ? "Processing replay..." : "Processing CRM update...");
       const r = await postAction(`orders/${order.id}/${kind}`);
       notify(`${r.message} Verification completed.`);
       await refresh();
@@ -351,7 +351,7 @@ export function OrdersPage({ data, refresh, busy, setBusy, notify }: PageProps) 
           confirmLabel="Confirm update"
         />
       )}
-      {/* â”€â”€ Metric cards â”€â”€ */}
+      {/* -- Metric cards -- */}
       <section className="metric-grid orders-metric-grid">
         <MetricCard label="Total orders" value={data.orders.length} detail="From all datasets" tone="blue" />
         <MetricCard label="Synced orders" value={data.counts.SYNCED} detail="Verified matches" tone="green" />
@@ -359,7 +359,7 @@ export function OrdersPage({ data, refresh, busy, setBusy, notify }: PageProps) 
         <MetricCard label="Not eligible" value={data.counts.NOT_ELIGIBLE} detail="Excluded from sync" tone="purple" />
       </section>
 
-      {/* â”€â”€ Main Orders Surface Card â”€â”€ */}
+      {/* -- Main Orders Surface Card -- */}
       <section className="orders-surface-card">
         {/* Toolbar with Search, Status Filters, and Sort */}
         <div className="orders-toolbar">
@@ -439,7 +439,7 @@ export function OrdersPage({ data, refresh, busy, setBusy, notify }: PageProps) 
         {orders.length > 0 && (
           <div className="orders-pagination-bar">
             <span className="pagination-info">
-              Showing {((page - 1) * pageSize) + 1}â€“{Math.min(page * pageSize, orders.length)} of {orders.length} orders
+              Showing {((page - 1) * pageSize) + 1}-{Math.min(page * pageSize, orders.length)} of {orders.length} orders
             </span>
             <div className="pagination-buttons">
               <button
@@ -469,13 +469,13 @@ export function OrdersPage({ data, refresh, busy, setBusy, notify }: PageProps) 
   );
 }
 
-/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+/* ===========================================================
    Order Investigation
-â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
+=========================================================== */
 function valueForField(order: Order, field: string, side: "woo" | "crm"): string {
   const values = side === "woo"
     ? { billing_email: order.customer_email, total: formatMoney(order.total, order.currency), currency: order.currency, order_status: order.status }
-    : { billing_email: order.crm?.email || "No CRM record", total: order.crm ? formatMoney(order.crm.total, order.crm.currency) : "No CRM record", currency: order.crm?.currency || "â€”", order_status: order.crm?.order_status || "â€”" };
+    : { billing_email: order.crm?.email || "No CRM record", total: order.crm ? formatMoney(order.crm.total, order.crm.currency) : "No CRM record", currency: order.crm?.currency || "-", order_status: order.crm?.order_status || "-" };
   return values[field as keyof typeof values];
 }
 
@@ -545,7 +545,7 @@ export function OrderInvestigationPage({ data, refresh, busy, setBusy, notify, o
             </div>
           </section>
         </main>
-        <aside className="investigation-sidebar"><section className="action-card surface"><div className="action-card-title"><RefreshCw size={29} /><div><h3>{actionTitle}</h3><p>{actionDescription}</p></div></div>{order.state === "MISMATCH" ? <button className="button primary action-primary" disabled={busy} onClick={() => setConfirming(true)}><Play size={16} /> Review correction</button> : <button className="button primary action-primary" disabled={busy || order.state === "SYNCED" || order.state === "NOT_ELIGIBLE"} onClick={() => action("replay")}><Play size={16} /> {busy ? "Working…" : order.state === "ERROR" ? "Retry replay" : "Replay and verify"}</button>}<button className="action-link" onClick={loadHistory} disabled={loadingHistory}>Re-check only</button><div className="risk-note"><ShieldCheck size={22} /><div><b>Risk Guard will apply the rules</b><p>The order may be sent and verified, held for review, or blocked if it is not permitted.</p><button onClick={() => onNavigate("/woocrm/risk-guard")}>View Risk Guard rules →</button></div></div><div className="safe-note"><CheckCircle2 size={25} /><b>Safe to retry. Will not create duplicates.</b></div></section></aside>
+        <aside className="investigation-sidebar"><section className="action-card surface"><div className="action-card-title"><RefreshCw size={29} /><div><h3>{actionTitle}</h3><p>{actionDescription}</p></div></div>{order.state === "MISMATCH" ? <button className="button primary action-primary" disabled={busy} onClick={() => setConfirming(true)}><Play size={16} /> Review correction</button> : <button className="button primary action-primary" disabled={busy || order.state === "SYNCED" || order.state === "NOT_ELIGIBLE"} onClick={() => action("replay")}><Play size={16} /> {busy ? "Working…" : order.state === "ERROR" ? "Retry replay" : "Replay and verify"}</button>}<button className="action-link" onClick={loadHistory} disabled={loadingHistory}>Re-check only</button><div className="risk-note"><ShieldCheck size={22} /><div><b>Risk Guard will apply the rules</b><p>The order may be sent and verified, held for review, or blocked if it is not permitted.</p><button onClick={() => onNavigate("/woocrm/risk-guard")}>View Risk Guard rules →</button></div></div>        <div className="safe-note"><CheckCircle2 size={25} /><b>Demo orders are matched by dataset and order ID; concurrent requests are not coordinated.</b></div></section></aside>
       </div>
       {actionError && <div className="action-error"><XCircle size={17} />{actionError}</div>}
       <section className="surface history-panel">
@@ -592,9 +592,9 @@ export function OrderInvestigationPage({ data, refresh, busy, setBusy, notify, o
   );
 }
 
-/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+/* ===========================================================
    Customers Page
-â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
+=========================================================== */
 export function CustomersPage({ data, onNavigate }: PageProps) {
   const [query, setQuery] = useState(new URLSearchParams(window.location.search).get("search") || "");
   const [filter, setFilter] = useState<"ALL" | "ATTENTION">("ALL");
@@ -796,7 +796,7 @@ export function CustomersPage({ data, onNavigate }: PageProps) {
           <EmptyState title="No customer groups found" message="Customer groups appear after eligible orders are loaded." />
         )}
         <div className="customer-table-footer">
-          Showing 1â€“{customers.length} of {data.eligible_customer_count} customer groups
+          Showing 1-{customers.length} of {data.eligible_customer_count} customer groups
         </div>
       </section>
 
@@ -824,9 +824,9 @@ export function CustomersPage({ data, onNavigate }: PageProps) {
   );
 }
 
-/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+/* ===========================================================
    Settings Page
-â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
+=========================================================== */
 export function SettingsPage({ data, refresh, busy, setBusy, notify, onNavigate }: PageProps) {
   const [tab, setTab] = useState<"connections" | "risk" | "data">("connections");
   const [connection, setConnection] = useState<"idle" | "verified" | "failed">("idle");
@@ -1257,13 +1257,8 @@ export function SettingsPage({ data, refresh, busy, setBusy, notify, onNavigate 
 
             <div className="sp-modal-footer">
               <button className="sp-btn-secondary" onClick={() => setConfigModal(null)}>Cancel</button>
-              <button
-                className="sp-btn-primary"
-                onClick={() => {
-                  notify(`${configModal === "woo" ? "WooCommerce" : "HubSpot"} credentials saved (demo mock mode remains active)`);
-                  setConfigModal(null);
-                }}
-              >
+              <span>Live connection: planned</span>
+              <button className="sp-btn-primary" disabled>
                 Save configuration
               </button>
             </div>
@@ -1362,7 +1357,7 @@ export function SettingsPage({ data, refresh, busy, setBusy, notify, onNavigate 
 
 
 
-/* â”€â”€â”€ Risk Guard Settings Panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* --- Risk Guard Settings Panel --------------------------- */
 function RiskGuardSettingsPanel({ notify }: { notify: (message: string) => void }) {
   const [settings, setSettings] = useState<RiskSettings | null>(null);
   const [draft, setDraft] = useState<RiskSettings | null>(null);
@@ -1431,9 +1426,9 @@ function RiskGuardSettingsPanel({ notify }: { notify: (message: string) => void 
   );
 }
 
-/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+/* ===========================================================
    Risk Guard Page
-â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
+=========================================================== */
 export function RiskGuardPage({ notify, onNavigate }: PageProps) {
   const [evaluations, setEvaluations] = useState<RiskEvaluation[]>([]);
   const [tab, setTab] = useState<"review" | "blocked" | "approved" | "history">("review");
@@ -1694,9 +1689,9 @@ export function RiskGuardPage({ notify, onNavigate }: PageProps) {
   );
 }
 
-/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+/* ===========================================================
    Import Page
-â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
+=========================================================== */
 const DEFAULT_SAMPLE_ROWS = [
   { id: "2001", customer_email: "alex.morgan@example.com", customer_name: "Alex Morgan", total: "129.00", currency: "USD", status: "processing", created_at: "2026-10-01 10:30:00" },
   { id: "2002", customer_email: "jamie.lee@example.com", customer_name: "Jamie Lee", total: "82.50", currency: "USD", status: "completed", created_at: "2026-10-02 11:15:00" },
@@ -1863,7 +1858,7 @@ export function ImportPage({ data, refresh, busy, setBusy, notify }: PageProps) 
 
   return (
     <div className="import-page">
-      {/* â”€â”€ Top Metric Status Strip â”€â”€ */}
+      {/* -- Top Metric Status Strip -- */}
       <section className="import-status-strip surface">
         <div className="import-status-item">
           <div className="import-status-icon-bubble">
@@ -1883,7 +1878,7 @@ export function ImportPage({ data, refresh, busy, setBusy, notify }: PageProps) 
           </div>
           <div className="import-status-item-text">
             <span>Orders in dataset</span>
-            <strong>{datasetIsCurrent ? data.orders.length : "â€”"}</strong>
+            <strong>{datasetIsCurrent ? data.orders.length : "-"}</strong>
           </div>
         </div>
 
@@ -1904,12 +1899,12 @@ export function ImportPage({ data, refresh, busy, setBusy, notify }: PageProps) 
           </div>
           <div className="import-status-item-text">
             <span>Awaiting reconciliation</span>
-            <strong>{datasetIsCurrent ? awaiting : "â€”"}</strong>
+            <strong>{datasetIsCurrent ? awaiting : "-"}</strong>
           </div>
         </div>
       </section>
 
-      {/* â”€â”€ Two Column Import Layout â”€â”€ */}
+      {/* -- Two Column Import Layout -- */}
       <div className="import-layout">
         {/* Left Column: Import Workflow */}
         <section className="surface import-card">
@@ -2015,7 +2010,7 @@ export function ImportPage({ data, refresh, busy, setBusy, notify }: PageProps) 
                   <FileText size={20} className="selected-file-icon" />
                   <div>
                     <strong className="selected-file-name">{fileName}</strong>
-                    <span className="selected-file-meta">{fileSize} â€¢ {fileRows} rows</span>
+                    <span className="selected-file-meta">{fileSize} - {fileRows} rows</span>
                   </div>
                 </div>
                 <button
@@ -2121,7 +2116,7 @@ export function ImportPage({ data, refresh, busy, setBusy, notify }: PageProps) 
               {busy ? (
                 <>
                   <RefreshCw className="spin" size={15} />
-                  <span>Importingâ€¦</span>
+                  <span>Importing...</span>
                 </>
               ) : (
                 <>
@@ -2176,7 +2171,7 @@ export function ImportPage({ data, refresh, busy, setBusy, notify }: PageProps) 
                   <div className="import-stat-card card-amber">
                     <AlertTriangle size={16} className="stat-icon-amber" />
                     <strong>{result.skipped}</strong>
-                    <span>Skipped â“˜</span>
+                    <span>Skipped x</span>
                   </div>
 
                   <div className="import-stat-card card-red">
