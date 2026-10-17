@@ -54,23 +54,23 @@
   <circle cx="30" cy="640" r="110" fill="#1D4ED8" opacity="0.3" filter="url(#softBlur)" />
 
   <!-- Wave 1: Smooth sweeping dark blue diagonal wave from right to bottom-left -->
-  <path d="M 240,280 C 240,360 170,440 100,520 C 50,578 10,610 0,630 L 0,850 L 240,850 Z" 
+  <path d="M 240,280 C 240,360 170,440 100,520 C 50,578 10,610 0,630 L 0,850 L 240,850 Z"
         fill="url(#wave1Grad)" />
 
   <!-- Wave 2: Purple / Violet luminous ribbon -->
-  <path d="M 240,430 C 190,480 140,540 85,590 C 35,635 10,655 0,668 L 0,720 C 20,705 55,675 110,630 C 160,590 205,530 240,475 Z" 
+  <path d="M 240,430 C 190,480 140,540 85,590 C 35,635 10,655 0,668 L 0,720 C 20,705 55,675 110,630 C 160,590 205,530 240,475 Z"
         fill="url(#purpleRibbon)" />
 
   <!-- Wave 3: Blue underwave sweep along the bottom left -->
-  <path d="M 0,620 C 25,605 60,580 95,550 C 60,600 25,650 0,685 Z" 
+  <path d="M 0,620 C 25,605 60,580 95,550 C 60,600 25,650 0,685 Z"
         fill="url(#blueUnderwave)" />
 
   <!-- Fine glowing edge accent line -->
-  <path d="M 240,430 C 190,480 140,540 85,590 C 35,635 10,655 0,668" 
+  <path d="M 240,430 C 190,480 140,540 85,590 C 35,635 10,655 0,668"
         fill="none" stroke="url(#rimGlow)" stroke-width="1.8" opacity="0.8" />
 
   <!-- Subtle lower arc highlight -->
-  <path d="M 240,475 C 205,530 160,590 110,630 C 55,675 20,705 0,720" 
+  <path d="M 240,475 C 205,530 160,590 110,630 C 55,675 20,705 0,720"
         fill="none" stroke="#6366F1" stroke-width="1.2" opacity="0.35" />
 
 </svg>
