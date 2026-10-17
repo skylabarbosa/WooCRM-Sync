@@ -141,9 +141,13 @@ async def enforce_access_control(request: Request, call_next: Any) -> Any:
 @contextmanager
 def db() -> Any:
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(DATABASE_PATH)
+    # SQLite does not provide row-level locks.  Starting every write unit with
+    # an immediate transaction serializes check-then-create paths, so a retry
+    # cannot race another sync into creating a second record.
+    connection = sqlite3.connect(DATABASE_PATH, timeout=10.0)
     connection.row_factory = sqlite3.Row
     try:
+        connection.execute("BEGIN IMMEDIATE")
         yield connection
         connection.commit()
     except Exception:
@@ -193,6 +197,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
           environment TEXT NOT NULL DEFAULT 'demo', last_checked_at TEXT,
           PRIMARY KEY (dataset, id)
         );
+        CREATE UNIQUE INDEX IF NOT EXISTS orders_dataset_id_unique ON orders(dataset, id);
         CREATE TABLE IF NOT EXISTS customers (
           dataset TEXT NOT NULL DEFAULT 'default', email TEXT NOT NULL, name TEXT NOT NULL,
           order_count INTEGER NOT NULL DEFAULT 0, lifetime_value REAL NOT NULL DEFAULT 0,
@@ -206,6 +211,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
           environment TEXT NOT NULL DEFAULT 'demo', last_checked_at TEXT,
           PRIMARY KEY (dataset, order_id)
         );
+        CREATE UNIQUE INDEX IF NOT EXISTS crm_orders_dataset_order_id_unique ON crm_orders(dataset, order_id);
         CREATE TABLE IF NOT EXISTS crm_contacts (
           dataset TEXT NOT NULL DEFAULT 'default', email TEXT NOT NULL,
           status TEXT NOT NULL CHECK(status IN ('FOUND', 'NOT_FOUND')),

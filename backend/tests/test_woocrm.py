@@ -1,5 +1,6 @@
 import pytest
 import httpx
+from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -570,3 +571,25 @@ def test_reconciliation_does_not_repair_missing_records():
     snapshot = client.get(f"/api/woocrm/dashboard?dataset={dataset}").json()
     assert snapshot["counts"]["MISSING"] == 1
     assert snapshot["orders"][0]["crm"] is None
+
+
+def test_simultaneous_import_retries_create_one_order():
+    """The transaction and composite key make a duplicate retry harmless."""
+    dataset = f"race-{uuid4().hex}"
+    order = {
+        "id": "once", "customer_email": "once@example.com", "customer_name": "Once",
+        "total": 10, "currency": "USD", "status": "processing", "created_at": "2026-10-30T10:00:00Z",
+    }
+
+    def submit():
+        with TestClient(app) as concurrent_client:
+            return concurrent_client.post(f"/api/woocrm/import/orders?dataset={dataset}", json=[order]).json()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: submit(), range(2)))
+
+    assert sorted(result["inserted"] for result in results) == [0, 1]
+    with db() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM orders WHERE dataset=? AND id='once'", (dataset,)
+        ).fetchone()[0] == 1
