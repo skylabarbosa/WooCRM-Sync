@@ -865,6 +865,16 @@ def health() -> dict[str, str]:
     return {"status": "ok", "service": "woocrm-sync"}
 
 
+@app.get("/api/woocrm/ready")
+def ready() -> JSONResponse:
+    try:
+        with db() as connection:
+            connection.execute("SELECT 1").fetchone()
+    except sqlite3.Error:
+        return JSONResponse(status_code=503, content={"status": "unavailable"})
+    return JSONResponse(status_code=200, content={"status": "ok"})
+
+
 @app.get("/api/woocrm/config")
 def config() -> dict[str, Any]:
     return connector_status()

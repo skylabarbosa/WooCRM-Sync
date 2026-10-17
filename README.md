@@ -54,6 +54,8 @@ npm run dev
 ```
 
 Open http://localhost:5173/woocrm/ (Vite's fallback serves the dashboard at this path too).
+For a non-default API URL, copy `frontend/.env.example` to `frontend/.env.local` and set
+`VITE_API_URL` there; do not put API keys in `VITE_*` variables.
 
 ## Test
 
