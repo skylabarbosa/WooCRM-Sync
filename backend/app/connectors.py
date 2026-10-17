@@ -171,12 +171,15 @@ class HubSpotCRMAdapter:
         token = os.getenv("HUBSPOT_ACCESS_TOKEN", "").strip()
         if not token:
             raise ConnectorError(self.source, "HubSpot access token is not configured")
-        self._client = client or httpx.Client(timeout=20.0, headers={"Authorization": f"Bearer {token}"})
+        self._token = token
+        self._client = client or httpx.Client(timeout=20.0)
         self._base = "https://api.hubapi.com"
 
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         try:
-            response = self._client.request(method, f"{self._base}{path}", **kwargs)
+            headers = dict(kwargs.pop("headers", {}))
+            headers["Authorization"] = f"Bearer {self._token}"
+            response = self._client.request(method, f"{self._base}{path}", headers=headers, **kwargs)
         except httpx.TimeoutException as exc:
             raise ConnectorError(self.source, "HubSpot request timed out", retryable=True) from exc
         except httpx.RequestError as exc:

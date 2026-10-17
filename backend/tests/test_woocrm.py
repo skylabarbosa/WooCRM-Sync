@@ -441,6 +441,23 @@ def test_hubspot_connector_searches_by_stable_id_and_verifies_write(monkeypatch)
     assert b'"woocrm_order_id":"42"' in calls[1][2]
 
 
+def test_hubspot_connector_sends_bearer_token_without_exposing_it(monkeypatch):
+    token = "hubspot-secret-token"
+    monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", token)
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(401, json={"message": f"do not echo {token}"})
+
+    adapter = HubSpotCRMAdapter(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    with pytest.raises(ConnectorError) as raised:
+        adapter.test_connection()
+
+    assert requests[0].headers["Authorization"] == f"Bearer {token}"
+    assert token not in str(raised.value)
+
+
 def test_hubspot_search_rejects_malformed_results_instead_of_missing(monkeypatch):
     monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", "token")
     transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"unexpected": []}))
