@@ -50,12 +50,22 @@ def _timestamp(value: Any) -> datetime | None:
 def fingerprint(order: Any, crm: Any | None) -> str:
     payload = {
         "order_id": str(_get(order, "id")),
+        "order_customer_email": _get(order, "customer_email"),
+        "order_customer_name": _get(order, "customer_name"),
         "order_total": _get(order, "total"),
         "order_currency": _get(order, "currency"),
         "order_status": _get(order, "status"),
+        "order_created_at": _get(order, "created_at"),
         "order_modified_at": _get(order, "modified_at"),
+        "crm_order_id": _get(crm, "order_id"),
+        "crm_external_id": _get(crm, "external_id"),
+        "crm_email": _get(crm, "email"),
+        "crm_name": _get(crm, "name"),
         "crm_total": _get(crm, "total"),
         "crm_currency": _get(crm, "currency"),
+        "crm_status": _get(crm, "status"),
+        "crm_order_status": _get(crm, "order_status"),
+        "crm_id": _get(crm, "crm_id"),
         "crm_updated_at": _get(crm, "updated_at"),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()

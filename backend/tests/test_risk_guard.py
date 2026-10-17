@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from app import main
 from app.main import app, db
-from app.risk_guard import RiskSettings, evaluate_batch, evaluate_change
+from app.risk_guard import RiskSettings, evaluate_batch, evaluate_change, fingerprint
 
 client = TestClient(app)
 
@@ -62,6 +62,42 @@ def test_newer_crm_and_missing_timestamps_are_conservative():
     assert "UNTRUSTWORTHY_TIMESTAMPS" in missing["rule_ids"]
 
 
+@pytest.mark.parametrize("field", [
+    "customer_email", "customer_name", "total", "currency", "status", "created_at", "modified_at",
+])
+def test_fingerprint_covers_order_fields_used_by_reconciliation_and_writes(field):
+    original = fingerprint(order(), crm())
+    changed = order()
+    changed[field] = "changed@example.com" if field == "customer_email" else (
+        "Changed Name" if field == "customer_name" else (
+            101 if field == "total" else (
+                "EUR" if field == "currency" else (
+                    "completed" if field == "status" else "2026-10-15T10:00:00+00:00"
+                )
+            )
+        )
+    )
+    assert fingerprint(changed, crm()) != original
+
+
+@pytest.mark.parametrize("field", ["email", "name", "total", "currency", "status", "order_status", "updated_at"])
+def test_fingerprint_covers_crm_fields_used_by_reconciliation_and_writes(field):
+    original = fingerprint(order(), crm())
+    changed = crm()
+    changed[field] = "changed@example.com" if field == "email" else (
+        "Changed Name" if field == "name" else (
+            101 if field == "total" else (
+                "EUR" if field == "currency" else (
+                    "ERROR" if field == "status" else (
+                        "completed" if field == "order_status" else "2026-10-15T10:00:00+00:00"
+                    )
+                )
+            )
+        )
+    )
+    assert fingerprint(order(), changed) != original
+
+
 def test_bulk_rule_reports_no_baseline_when_unavailable():
     result = evaluate_batch(4, RiskSettings(batch_change_limit=3))
     assert result["risk_status"] == "REVIEW_REQUIRED"
@@ -78,6 +114,23 @@ def test_approval_is_specific_and_stale_records_are_rejected():
     assert client.post(f"/api/woocrm/risk-guard/evaluations/{evaluation_id}/approve", headers={"x-actor": "tester"}, json={"actor": "tester"}).status_code == 200
     with db() as connection:
         connection.execute("UPDATE crm_orders SET total=total+2 WHERE order_id='1001'")
+    stale = client.post(f"/api/woocrm/orders/1001/update?approval_id={evaluation_id}")
+    assert stale.status_code == 409
+
+
+def test_approval_is_invalidated_when_write_email_changes():
+    with db() as connection:
+        connection.execute("UPDATE risk_settings SET value='0' WHERE key='absolute_total_change'")
+        connection.execute("UPDATE crm_orders SET total=total+1 WHERE order_id='1001'")
+    response = client.post("/api/woocrm/orders/1001/update")
+    assert response.status_code == 409
+    evaluation_id = response.json()["detail"]["evaluation_id"]
+    assert client.post(
+        f"/api/woocrm/risk-guard/evaluations/{evaluation_id}/approve",
+        json={"actor": "tester"},
+    ).status_code == 200
+    with db() as connection:
+        connection.execute("UPDATE orders SET customer_email='changed@example.com' WHERE id='1001'")
     stale = client.post(f"/api/woocrm/orders/1001/update?approval_id={evaluation_id}")
     assert stale.status_code == 409
 
