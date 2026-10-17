@@ -409,6 +409,24 @@ def test_woocommerce_timeout_is_an_explicit_connector_error(monkeypatch):
     assert raised.value.retryable is True
 
 
+def test_woocommerce_retries_mocked_timeout_then_succeeds(monkeypatch):
+    monkeypatch.setenv("WOOCOMMERCE_STORE_URL", "https://shop.example")
+    monkeypatch.setenv("WOOCOMMERCE_CONSUMER_KEY", "key")
+    monkeypatch.setenv("WOOCOMMERCE_CONSUMER_SECRET", "secret")
+    monkeypatch.setenv("CONNECTOR_MAX_ATTEMPTS", "2")
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ReadTimeout("simulated timeout", request=request)
+        return httpx.Response(200, json=[])
+
+    assert WooCommerceClient(client=httpx.Client(transport=httpx.MockTransport(handler))).list_orders() == []
+    assert calls == 2
+
+
 def test_hubspot_connector_searches_by_stable_id_and_verifies_write(monkeypatch):
     monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", "token")
     calls = []
@@ -457,6 +475,33 @@ def test_hubspot_connector_sends_bearer_token_without_exposing_it(monkeypatch):
 
     assert requests[0].headers["Authorization"] == f"Bearer {token}"
     assert token not in str(raised.value)
+
+
+def test_hubspot_mocked_authentication_failure_is_not_retried(monkeypatch):
+    monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", "token")
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(401, json={"message": "unauthorized"})
+
+    with pytest.raises(ConnectorError, match="authentication or permission") as raised:
+        HubSpotCRMAdapter(client=httpx.Client(transport=httpx.MockTransport(handler))).test_connection()
+    assert raised.value.retryable is False
+    assert calls == 1
+
+
+def test_hubspot_retries_mocked_service_failure_then_succeeds(monkeypatch):
+    monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", "token")
+    monkeypatch.setenv("CONNECTOR_MAX_ATTEMPTS", "2")
+    responses = [httpx.Response(503), httpx.Response(200, json={"results": []})]
+
+    def handler(request):
+        return responses.pop(0)
+
+    HubSpotCRMAdapter(client=httpx.Client(transport=httpx.MockTransport(handler))).test_connection()
+    assert responses == []
 
 
 def test_hubspot_search_rejects_malformed_results_instead_of_missing(monkeypatch):

@@ -73,6 +73,16 @@ def writes_enabled() -> bool:
     return os.getenv("CRM_WRITE_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
 
 
+def connector_max_attempts() -> int:
+    try:
+        attempts = int(os.getenv("CONNECTOR_MAX_ATTEMPTS", "3"))
+    except ValueError as exc:
+        raise RuntimeError("CONNECTOR_MAX_ATTEMPTS must be an integer") from exc
+    if not 1 <= attempts <= 5:
+        raise RuntimeError("CONNECTOR_MAX_ATTEMPTS must be between 1 and 5")
+    return attempts
+
+
 def hubspot_field_mapping() -> dict[str, str]:
     return {
         "order_id": os.getenv("HUBSPOT_ORDER_ID_PROPERTY", "woocrm_order_id").strip(),
@@ -107,15 +117,19 @@ class WooCommerceClient:
         self._client = client or httpx.Client(timeout=20.0)
 
     def _get(self, params: dict[str, Any]) -> httpx.Response:
-        try:
-            response = self._client.get(self._url, params=params, auth=self._auth)
-        except httpx.TimeoutException as exc:
-            raise ConnectorError(self.source, "WooCommerce request timed out", retryable=True) from exc
-        except httpx.RequestError as exc:
-            raise ConnectorError(self.source, "WooCommerce service is unavailable", retryable=True) from exc
-        if response.status_code >= 400:
-            raise _error(response, self.source)
-        return response
+        for attempt in range(connector_max_attempts()):
+            try:
+                response = self._client.get(self._url, params=params, auth=self._auth)
+                if response.status_code < 400:
+                    return response
+                error = _error(response, self.source)
+            except httpx.TimeoutException as exc:
+                error = ConnectorError(self.source, "WooCommerce request timed out", retryable=True)
+            except httpx.RequestError as exc:
+                error = ConnectorError(self.source, "WooCommerce service is unavailable", retryable=True)
+            if not error.retryable or attempt + 1 == connector_max_attempts():
+                raise error
+        raise AssertionError("unreachable")
 
     def test_connection(self) -> None:
         self._get({"per_page": 1})
@@ -176,17 +190,21 @@ class HubSpotCRMAdapter:
         self._base = "https://api.hubapi.com"
 
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
-        try:
-            headers = dict(kwargs.pop("headers", {}))
-            headers["Authorization"] = f"Bearer {self._token}"
-            response = self._client.request(method, f"{self._base}{path}", headers=headers, **kwargs)
-        except httpx.TimeoutException as exc:
-            raise ConnectorError(self.source, "HubSpot request timed out", retryable=True) from exc
-        except httpx.RequestError as exc:
-            raise ConnectorError(self.source, "HubSpot service is unavailable", retryable=True) from exc
-        if response.status_code >= 400:
-            raise _error(response, self.source)
-        return response
+        headers = dict(kwargs.pop("headers", {}))
+        headers["Authorization"] = f"Bearer {self._token}"
+        for attempt in range(connector_max_attempts()):
+            try:
+                response = self._client.request(method, f"{self._base}{path}", headers=headers, **kwargs)
+                if response.status_code < 400:
+                    return response
+                error = _error(response, self.source)
+            except httpx.TimeoutException as exc:
+                error = ConnectorError(self.source, "HubSpot request timed out", retryable=True)
+            except httpx.RequestError as exc:
+                error = ConnectorError(self.source, "HubSpot service is unavailable", retryable=True)
+            if not error.retryable or attempt + 1 == connector_max_attempts():
+                raise error
+        raise AssertionError("unreachable")
 
     def test_connection(self) -> None:
         mapping = self._properties()
