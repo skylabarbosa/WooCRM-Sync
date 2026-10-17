@@ -3,12 +3,35 @@ import importlib
 import os
 import subprocess
 import sys
+import base64
+import hashlib
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app import main
 from app.connectors import ConnectorError
+
+
+def production_auth(monkeypatch):
+    def password_hash(password):
+        salt = b"test-auth-salt"
+        derived = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 1000)
+        return "pbkdf2_sha256$1000$%s$%s" % (
+            base64.urlsafe_b64encode(salt).decode(), base64.urlsafe_b64encode(derived).decode(),
+        )
+    monkeypatch.setenv("AUTH_TOKEN_SECRET", "test-signing-secret")
+    monkeypatch.setenv("AUTH_USERS_JSON", json.dumps([
+        {"username": "viewer", "role": "viewer", "password_hash": password_hash("viewer-password")},
+        {"username": "operator", "role": "operator", "password_hash": password_hash("operator-password")},
+        {"username": "admin", "role": "admin", "password_hash": password_hash("admin-password")},
+    ]))
+
+
+def bearer(client, username, password):
+    response = client.post("/api/woocrm/auth/login", json={"username": username, "password": password})
+    assert response.status_code == 200
+    return {"Authorization": f"Bearer {response.json()['access_token']}"}
 
 
 @pytest.fixture
@@ -21,34 +44,41 @@ def isolated_app(tmp_path, monkeypatch):
     return TestClient(main.app)
 
 
-def test_production_requires_key_for_reads_and_writes(tmp_path, monkeypatch):
+def test_production_requires_user_authentication_and_roles(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "DATABASE_PATH", tmp_path / "production.db")
     monkeypatch.setenv("APP_ENV", "production")
-    monkeypatch.setenv("API_ACCESS_KEY", "correct-key")
+    production_auth(monkeypatch)
+    main.init_db()
     client = TestClient(main.app)
 
     assert client.get("/api/woocrm/dashboard").status_code == 401
     assert client.post("/api/woocrm/reset").status_code == 401
+    assert client.get("/api/woocrm/dashboard", headers=bearer(client, "viewer", "viewer-password")).status_code == 200
+    assert client.post("/api/woocrm/reconcile", headers=bearer(client, "viewer", "viewer-password")).status_code == 403
+    assert client.post("/api/woocrm/reconcile", headers=bearer(client, "operator", "operator-password")).status_code == 200
+    assert client.post("/api/woocrm/reset", headers=bearer(client, "operator", "operator-password")).status_code == 403
+    assert client.post("/api/woocrm/reset", headers=bearer(client, "admin", "admin-password")).status_code == 403
     assert client.get("/api/woocrm/health").status_code == 200
     assert client.get("/api/woocrm/ready").status_code == 200
 
 
-def test_invalid_key_is_rejected_before_work(tmp_path, monkeypatch):
+def test_invalid_credentials_are_rejected_before_work(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "DATABASE_PATH", tmp_path / "production.db")
     monkeypatch.setenv("APP_ENV", "production")
-    monkeypatch.setenv("API_ACCESS_KEY", "correct-key")
+    production_auth(monkeypatch)
     client = TestClient(main.app)
 
-    response = client.get("/api/woocrm/dashboard", headers={"X-API-Key": "wrong-key"})
+    response = client.post("/api/woocrm/auth/login", json={"username": "operator", "password": "wrong-password"})
     assert response.status_code == 401
-    assert response.json() == {"detail": "Authentication required"}
+    assert response.json() == {"detail": "Invalid credentials"}
 
 
-def test_missing_production_key_refuses_startup(tmp_path):
+def test_missing_production_auth_configuration_refuses_startup(tmp_path):
     main.DATABASE_PATH = tmp_path / "startup-guard.db"
     environment = os.environ.copy()
     environment.update({"APP_ENV": "production", "DATABASE_PATH": str(tmp_path / "startup.db")})
-    environment.pop("API_ACCESS_KEY", None)
+    environment.pop("AUTH_TOKEN_SECRET", None)
+    environment.pop("AUTH_USERS_JSON", None)
     result = subprocess.run(
         [sys.executable, "-c", "import app.main"],
         cwd=main.BASE_DIR,
@@ -57,7 +87,7 @@ def test_missing_production_key_refuses_startup(tmp_path):
         text=True,
     )
     assert result.returncode != 0
-    assert "API_ACCESS_KEY is required" in result.stderr
+    assert "AUTH_TOKEN_SECRET is required" in result.stderr
 
 
 def test_server_owned_actor_ignores_client_actor(isolated_app, monkeypatch):
@@ -77,8 +107,8 @@ def test_server_owned_actor_ignores_client_actor(isolated_app, monkeypatch):
 
 def test_reset_is_blocked_by_environment_and_flag(isolated_app, monkeypatch):
     monkeypatch.setenv("APP_ENV", "production")
-    monkeypatch.setenv("API_ACCESS_KEY", "correct-key")
-    headers = {"X-API-Key": "correct-key"}
+    production_auth(monkeypatch)
+    headers = bearer(isolated_app, "admin", "admin-password")
     assert isolated_app.post("/api/woocrm/reset", headers=headers).status_code == 403
     monkeypatch.setenv("APP_ENV", "demo")
     monkeypatch.setenv("DEMO_RESET_ENABLED", "false")

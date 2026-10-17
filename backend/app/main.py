@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
 import csv
+import hashlib
+import hmac
 import io
 import json
 import logging
@@ -11,7 +14,7 @@ import secrets
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +42,7 @@ ELIGIBLE_STATUSES = {"processing", "completed"}
 ORDER_STATUSES = {"pending", "processing", "on-hold", "completed", "cancelled", "failed", "refunded", "checkout-draft"}
 CRM_STATUSES = {"SYNCED", "ERROR"}
 STATES = {"SYNCED", "MISSING", "MISMATCH", "ERROR", "NOT_ELIGIBLE"}
+ROLE_RANK = {"viewer": 1, "operator": 2, "admin": 3}
 
 app = FastAPI(title="WooCRM Sync", version="0.3.0")
 logger = logging.getLogger(__name__)
@@ -65,8 +69,71 @@ def operator_name() -> str:
     return os.getenv("OPERATOR_NAME", "operator").strip() or "operator"
 
 
-def configured_api_key() -> str:
-    return os.getenv("API_ACCESS_KEY", "").strip()
+def auth_token_secret() -> str:
+    return os.getenv("AUTH_TOKEN_SECRET", "").strip()
+
+
+def configured_users() -> dict[str, dict[str, str]]:
+    raw = os.getenv("AUTH_USERS_JSON", "").strip()
+    try:
+        users = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("AUTH_USERS_JSON must be valid JSON") from exc
+    if not isinstance(users, list) or not users:
+        raise RuntimeError("AUTH_USERS_JSON must contain at least one user")
+    configured: dict[str, dict[str, str]] = {}
+    for user in users:
+        if not isinstance(user, dict):
+            raise RuntimeError("AUTH_USERS_JSON entries must be objects")
+        username = str(user.get("username", "")).strip()
+        role = str(user.get("role", "")).strip().lower()
+        password_hash = str(user.get("password_hash", "")).strip()
+        if not username or role not in ROLE_RANK or not password_hash.startswith("pbkdf2_sha256$"):
+            raise RuntimeError("AUTH_USERS_JSON entries require username, valid role, and PBKDF2 password_hash")
+        configured[username] = {"role": role, "password_hash": password_hash}
+    return configured
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        algorithm, iterations, salt, expected = encoded.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        derived = hashlib.pbkdf2_hmac("sha256", password.encode(), base64.urlsafe_b64decode(salt.encode()), int(iterations))
+        return secrets.compare_digest(derived, base64.urlsafe_b64decode(expected.encode()))
+    except (ValueError, TypeError):
+        return False
+
+
+def _token_part(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode()
+
+
+def _decode_token_part(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def issue_access_token(username: str, role: str) -> str:
+    payload = json.dumps({"sub": username, "role": role, "exp": int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp())}, separators=(",", ":")).encode()
+    encoded = _token_part(payload)
+    signature = _token_part(hmac.new(auth_token_secret().encode(), encoded.encode(), hashlib.sha256).digest())
+    return f"{encoded}.{signature}"
+
+
+def token_identity(value: str) -> tuple[str, str] | None:
+    try:
+        encoded, signature = value.split(".", 1)
+        expected = _token_part(hmac.new(auth_token_secret().encode(), encoded.encode(), hashlib.sha256).digest())
+        if not secrets.compare_digest(signature, expected):
+            return None
+        payload = json.loads(_decode_token_part(encoded))
+        username, role, expires = payload["sub"], payload["role"], payload["exp"]
+        if not isinstance(username, str) or role not in ROLE_RANK or not isinstance(expires, int) or expires < int(datetime.now(timezone.utc).timestamp()):
+            return None
+        user = configured_users().get(username)
+        return (username, role) if user and user["role"] == role else None
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
 
 
 def import_limit(name: str, default: int) -> int:
@@ -88,7 +155,7 @@ def validate_dataset_name(dataset: str) -> str:
 
 def _redact_secrets(message: str) -> str:
     redacted = message
-    for secret in (configured_api_key(), os.getenv("HUBSPOT_ACCESS_TOKEN", "").strip(),
+    for secret in (auth_token_secret(), os.getenv("HUBSPOT_ACCESS_TOKEN", "").strip(),
                    os.getenv("WOOCOMMERCE_CONSUMER_KEY", "").strip(),
                    os.getenv("WOOCOMMERCE_CONSUMER_SECRET", "").strip()):
         if secret:
@@ -105,8 +172,10 @@ def connector_failure(exc: ConnectorError, operation: str) -> HTTPException:
 
 
 def validate_startup_config() -> None:
-    if app_env() == "production" and not configured_api_key():
-        raise RuntimeError("API_ACCESS_KEY is required when APP_ENV=production")
+    if app_env() == "production":
+        if not auth_token_secret():
+            raise RuntimeError("AUTH_TOKEN_SECRET is required when APP_ENV=production")
+        configured_users()
 
 
 validate_startup_config()
@@ -128,13 +197,15 @@ app.add_middleware(
 
 @app.middleware("http")
 async def enforce_access_control(request: Request, call_next: Any) -> Any:
-    if request.url.path not in {"/api/woocrm/health", "/api/woocrm/ready"}:
-        key = configured_api_key()
-        required = app_env() == "production" or (bool(key) and request.method not in {"GET", "HEAD", "OPTIONS"})
-        if required:
-            supplied = request.headers.get("x-api-key", "")
-            if not key or not secrets.compare_digest(supplied, key):
-                return JSONResponse(status_code=401, content={"detail": "Authentication required"})
+    public_paths = {"/api/woocrm/health", "/api/woocrm/ready", "/api/woocrm/auth/login"}
+    if app_env() == "production" and request.url.path not in public_paths and request.method != "OPTIONS":
+        required_role = "viewer" if request.method in {"GET", "HEAD"} else "operator"
+        if request.url.path == "/api/woocrm/reset":
+            required_role = "admin"
+        scheme, _, supplied = request.headers.get("authorization", "").partition(" ")
+        identity = token_identity(supplied) if scheme.lower() == "bearer" else None
+        if identity is None or ROLE_RANK[identity[1]] < ROLE_RANK[required_role]:
+            return JSONResponse(status_code=401 if identity is None else 403, content={"detail": "Authentication required" if identity is None else "Insufficient role"})
     return await call_next(request)
 
 
@@ -535,6 +606,11 @@ class RiskBatchPayload(BaseModel):
     order_ids: list[str]
 
 
+class LoginPayload(BaseModel):
+    username: str
+    password: str
+
+
 def run_sync(dataset: str = "default") -> SyncResult:
     if integration_mode() == "live":
         return run_live_sync(dataset)
@@ -869,6 +945,16 @@ init_db()
 @app.get("/api/woocrm/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "service": "woocrm-sync"}
+
+
+@app.post("/api/woocrm/auth/login")
+def login(payload: LoginPayload) -> dict[str, str]:
+    if app_env() != "production":
+        raise HTTPException(404, "Authentication is only enabled in production")
+    user = configured_users().get(payload.username.strip())
+    if not user or not verify_password(payload.password, user["password_hash"]):
+        raise HTTPException(401, "Invalid credentials")
+    return {"access_token": issue_access_token(payload.username.strip(), user["role"]), "token_type": "bearer", "role": user["role"]}
 
 
 @app.get("/api/woocrm/ready")
