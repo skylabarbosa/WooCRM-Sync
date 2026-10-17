@@ -733,11 +733,13 @@ def run_live_sync(dataset: str) -> SyncResult:
     for order in orders:
         checked = now()
         normalized_email = normalize_email(order.customer_email)
+        contact_error: ConnectorError | None = None
         if callable(find_contact) and normalized_email not in verified_contacts:
             try:
                 contact = find_contact(normalized_email)
             except ConnectorError as exc:
                 verified_contacts[normalized_email] = {"status": "LOOKUP_ERROR", "error": exc}
+                contact_error = exc
                 logger.warning("CRM contact lookup failed source=%s email=%s detail=%s",
                                exc.source, normalized_email, _redact_secrets(str(exc)))
             else:
@@ -745,6 +747,13 @@ def run_live_sync(dataset: str) -> SyncResult:
                     "status": "FOUND" if contact else "NOT_FOUND",
                     "contact_id": str(contact.get("id")) if isinstance(contact, dict) and contact.get("id") else None,
                 }
+        elif callable(find_contact):
+            cached_contact = verified_contacts.get(normalized_email)
+            if cached_contact and isinstance(cached_contact.get("error"), ConnectorError):
+                contact_error = cached_contact["error"]
+        if contact_error is not None:
+            fetched.append({"order": order, "checked": checked, "error": contact_error})
+            continue
         try:
             fetched.append({"order": order, "checked": checked, "crm": crm.find_order(order.id)})
         except (ConnectorError, ValueError) as exc:

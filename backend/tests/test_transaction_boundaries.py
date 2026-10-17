@@ -72,6 +72,55 @@ def test_live_reconciliation_persists_connector_failure_after_fetch(monkeypatch)
     assert dict(run) == {"status": "completed", "processed": 1}
 
 
+def test_live_reconciliation_persists_contact_lookup_failure_and_audit_event(monkeypatch):
+    monkeypatch.setenv("INTEGRATION_MODE", "live")
+    monkeypatch.setenv("CRM_PROVIDER", "hubspot")
+
+    class FakeWooCommerce:
+        def list_orders(self):
+            return [NormalizedOrder(
+                id="live-contact-failure-1",
+                customer_email="contact-failure@example.test",
+                customer_name="Contact Failure",
+                total=15,
+                currency="USD",
+                status="processing",
+                created_at="2026-10-17T10:00:00Z",
+            )]
+
+    class FailingHubSpot:
+        def find_contact(self, email):
+            raise ConnectorError("HubSpot", "malformed contact search response")
+
+        def find_order(self, order_id):
+            raise AssertionError("deal lookup should not run after contact lookup failure")
+
+    monkeypatch.setattr(main, "WooCommerceClient", FakeWooCommerce)
+    monkeypatch.setattr(main, "HubSpotCRMAdapter", FailingHubSpot)
+
+    response = client.post("/api/woocrm/reconcile")
+
+    assert response.status_code == 200
+    with main.db() as connection:
+        contact = connection.execute(
+            "SELECT status,contact_id FROM crm_contacts WHERE dataset=? AND email=?",
+            ("default", "contact-failure@example.test"),
+        ).fetchone()
+        crm = connection.execute(
+            "SELECT status,error_message FROM crm_orders WHERE dataset=? AND order_id=?",
+            ("default", "live-contact-failure-1"),
+        ).fetchone()
+        event = connection.execute(
+            "SELECT outcome,error_message FROM order_events WHERE dataset=? AND order_id=?",
+            ("default", "live-contact-failure-1"),
+        ).fetchone()
+    assert dict(contact) == {"status": "LOOKUP_ERROR", "contact_id": None}
+    assert crm["status"] == "ERROR"
+    assert crm["error_message"] == "HubSpot: malformed contact search response"
+    assert event["outcome"] == "failed"
+    assert event["error_message"] == "HubSpot: malformed contact search response"
+
+
 def test_live_reconciliation_persists_successful_external_values(monkeypatch):
     monkeypatch.setenv("INTEGRATION_MODE", "live")
     monkeypatch.setenv("CRM_PROVIDER", "hubspot")

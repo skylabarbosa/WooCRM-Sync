@@ -563,6 +563,21 @@ def test_hubspot_search_rejects_malformed_results_instead_of_missing(monkeypatch
         adapter.find_order("42")
 
 
+@pytest.mark.parametrize(
+    ("response", "error"),
+    [
+        (httpx.Response(200, content=b"{not-json"), "malformed contact search JSON"),
+        (httpx.Response(200, json={"unexpected": []}), "unexpected contact search response"),
+    ],
+)
+def test_hubspot_contact_search_rejects_malformed_responses(monkeypatch, response, error):
+    monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", "token")
+    transport = httpx.MockTransport(lambda request: response)
+    adapter = HubSpotCRMAdapter(client=httpx.Client(transport=transport))
+    with pytest.raises(ConnectorError, match=error):
+        adapter.find_contact("buyer@example.com")
+
+
 def test_hubspot_connection_checks_deals_without_writing(monkeypatch):
     monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", "token")
     requests = []

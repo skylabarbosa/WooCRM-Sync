@@ -230,9 +230,19 @@ class HubSpotCRMAdapter:
                 "limit": 1,
             },
         )
-        payload = response.json()
-        results = payload.get("results", []) if isinstance(payload, dict) else []
-        return results[0] if results else None
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise ConnectorError(self.source, "HubSpot returned malformed contact search JSON") from exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+            raise ConnectorError(self.source, "HubSpot returned an unexpected contact search response")
+        results = payload["results"]
+        if not results:
+            return None
+        contact = results[0]
+        if not isinstance(contact, dict) or not contact.get("id"):
+            raise ConnectorError(self.source, "HubSpot returned an invalid contact record")
+        return contact
 
     def find_order(self, external_order_id: str) -> NormalizedCRMOrder | None:
         mapping = self._properties()
