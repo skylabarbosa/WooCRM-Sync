@@ -2,83 +2,87 @@ import type { Dashboard, DatasetInfo, ImportResult, IntegrationStatus, OrderEven
 
 export const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
-export async function getDashboard(): Promise<Dashboard> {
-  const response = await fetch(`${API}/api/woocrm/dashboard`);
+const API_KEY_STORAGE = "woocrm-api-key";
+
+export class ApiError extends Error {
+  constructor(public readonly status: number, message: string) {
+    super(message);
+  }
+}
+
+export function getApiKey(): string {
+  return sessionStorage.getItem(API_KEY_STORAGE) || "";
+}
+
+export function setApiKey(value: string): void {
+  if (value.trim()) sessionStorage.setItem(API_KEY_STORAGE, value.trim());
+  else sessionStorage.removeItem(API_KEY_STORAGE);
+}
+
+async function request(path: string, init: RequestInit = {}): Promise<any> {
+  const headers = new Headers(init.headers);
+  const key = getApiKey();
+  if (key) headers.set("X-API-Key", key);
+  const response = await fetch(`${API}${path}`, { ...init, headers });
   const result = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(result?.detail || "Unable to load dashboard data");
+  if (!response.ok) {
+    if (response.status === 401) {
+      window.dispatchEvent(new Event("woocrm-auth-required"));
+      throw new ApiError(401, "Authentication required");
+    }
+    throw new ApiError(response.status, result?.detail || result?.message || "Request failed");
+  }
   return result;
+}
+
+export async function getDashboard(): Promise<Dashboard> {
+  return request("/api/woocrm/dashboard");
 }
 
 export async function testConnection(): Promise<IntegrationStatus & { message: string }> {
-  const response = await fetch(`${API}/api/woocrm/test-connection`, { method: "POST" });
-  const result = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(result?.detail || "Connection test failed");
-  return result;
+  return request("/api/woocrm/test-connection", { method: "POST" });
 }
 
 export async function getDatasets(): Promise<{ datasets: DatasetInfo[] }> {
-  const response = await fetch(`${API}/api/woocrm/datasets`);
-  const result = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(result?.detail || "Unable to load datasets");
-  return result;
+  return request("/api/woocrm/datasets");
 }
 
 export async function postAction(path: string): Promise<{ message: string; state?: string }> {
-  const response = await fetch(`${API}/api/woocrm/${path}`, { method: "POST" });
-  const result = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(result?.detail || result?.message || "Request failed");
-  return result;
+  return request(`/api/woocrm/${path}`, { method: "POST" });
 }
 
 export async function getOrderHistory(orderId: string | number): Promise<OrderEvent[]> {
-  const response = await fetch(`${API}/api/woocrm/orders/${encodeURIComponent(String(orderId))}/history`);
-  const result = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(result?.detail || "Unable to load order history");
+  const result = await request(`/api/woocrm/orders/${encodeURIComponent(String(orderId))}/history`);
   return result.events;
 }
 
 export async function importFile(source: "orders" | "crm-orders", file: File, dataset: string): Promise<ImportResult> {
   const format = file.name.toLowerCase().endsWith(".csv") ? "csv" : "json";
-  const response = await fetch(`${API}/api/woocrm/import/${source}?dataset=${encodeURIComponent(dataset || "default")}&format=${format}`, {
+  return request(`/api/woocrm/import/${source}?dataset=${encodeURIComponent(dataset || "default")}&format=${format}`, {
     method: "POST",
     headers: { "content-type": format === "csv" ? "text/csv" : "application/json" },
     body: file,
   });
-  const result = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(result?.detail || "Import failed; no records were changed");
-  return result;
 }
 
 export async function getRiskEvaluations(): Promise<{ evaluations: RiskEvaluation[] }> {
-  const response = await fetch(`${API}/api/woocrm/risk-guard/evaluations`);
-  const result = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(result?.detail || "Unable to load risk evaluations");
-  return result;
+  return request("/api/woocrm/risk-guard/evaluations");
 }
 
 export async function reviewRiskEvaluation(id: number, action: "approve" | "reject"): Promise<RiskEvaluation> {
-  const response = await fetch(`${API}/api/woocrm/risk-guard/evaluations/${id}/${action}`, {
-    method: "POST", headers: { "content-type": "application/json", "x-actor": "operator" }, body: JSON.stringify({ actor: "operator" }),
+  return request(`/api/woocrm/risk-guard/evaluations/${id}/${action}`, {
+    method: "POST", headers: { "content-type": "application/json" },
   });
-  const result = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(result?.detail?.message || result?.detail || "Risk review failed");
-  return result;
 }
 
 export async function getRiskSettings(): Promise<RiskSettings> {
-  const response = await fetch(`${API}/api/woocrm/risk-guard/settings`);
-  const result = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(result?.detail || "Unable to load Risk Guard settings");
-  return result;
+  return request("/api/woocrm/risk-guard/settings");
 }
 
 export async function updateRiskSettings(settings: RiskSettings): Promise<RiskSettings> {
-  const response = await fetch(`${API}/api/woocrm/risk-guard/settings`, {
+  return request("/api/woocrm/risk-guard/settings", {
     method: "PUT",
-    headers: { "content-type": "application/json", "x-actor": "operator" },
+    headers: { "content-type": "application/json" },
     body: JSON.stringify(settings),
   });
-  const result = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(result?.detail || "Unable to save Risk Guard settings");
-  return result;
 }

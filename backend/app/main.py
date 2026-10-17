@@ -5,14 +5,16 @@ import io
 import json
 import math
 import os
+import secrets
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from app.risk_guard import RiskSettings, evaluate_batch, evaluate_change
 
@@ -36,13 +38,56 @@ CRM_STATUSES = {"SYNCED", "ERROR"}
 STATES = {"SYNCED", "MISSING", "MISMATCH", "ERROR", "NOT_ELIGIBLE"}
 
 app = FastAPI(title="WooCRM Sync", version="0.3.0")
+
+
+def _is_true(value: str | None, *, default: bool = False) -> bool:
+    return (value or ("true" if default else "false")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def app_env() -> str:
+    return os.getenv("APP_ENV", "demo").strip().lower()
+
+
+def operator_name() -> str:
+    return os.getenv("OPERATOR_NAME", "operator").strip() or "operator"
+
+
+def configured_api_key() -> str:
+    return os.getenv("API_ACCESS_KEY", "").strip()
+
+
+def validate_startup_config() -> None:
+    if app_env() == "production" and not configured_api_key():
+        raise RuntimeError("API_ACCESS_KEY is required when APP_ENV=production")
+
+
+validate_startup_config()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        origin.strip()
+        for origin in os.getenv(
+            "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+        ).split(",")
+        if origin.strip()
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def enforce_access_control(request: Request, call_next: Any) -> Any:
+    if request.url.path not in {"/api/woocrm/health", "/api/woocrm/ready"}:
+        key = configured_api_key()
+        required = app_env() == "production" or (bool(key) and request.method not in {"GET", "HEAD", "OPTIONS"})
+        if required:
+            supplied = request.headers.get("x-api-key", "")
+            if not key or not secrets.compare_digest(supplied, key):
+                return JSONResponse(status_code=401, content={"detail": "Authentication required"})
+    return await call_next(request)
 
 
 @contextmanager
@@ -834,9 +879,7 @@ def evaluate_risk_batch(payload: RiskBatchPayload, dataset: str = Query("default
 
 
 @app.put("/api/woocrm/risk-guard/settings")
-def update_risk_settings(payload: RiskSettingsPayload, x_actor: str | None = Header(None)) -> dict[str, Any]:
-    if not x_actor or not x_actor.strip():
-        raise HTTPException(401, "An authenticated actor is required to change risk settings")
+def update_risk_settings(payload: RiskSettingsPayload) -> dict[str, Any]:
     if not math.isfinite(payload.absolute_total_change) or payload.absolute_total_change < 0:
         raise HTTPException(422, "absolute_total_change must be finite and non-negative")
     if not math.isfinite(payload.percentage_total_change) or payload.percentage_total_change < 0:
@@ -848,14 +891,12 @@ def update_risk_settings(payload: RiskSettingsPayload, x_actor: str | None = Hea
             "INSERT OR REPLACE INTO risk_settings(key,value) VALUES (?,?)",
             [(key, str(value)) for key, value in payload.model_dump().items()],
         )
-    return {**payload.model_dump(), "actor": x_actor.strip()}
+    return {**payload.model_dump(), "actor": operator_name()}
 
 
 @app.post("/api/woocrm/risk-guard/evaluations/{evaluation_id}/approve")
-def approve_risk_evaluation(evaluation_id: int, payload: RiskApproval, x_actor: str | None = Header(None)) -> dict[str, Any]:
-    actor = (x_actor or payload.actor or "").strip()
-    if not actor:
-        raise HTTPException(401, "An authenticated actor is required to approve a change")
+def approve_risk_evaluation(evaluation_id: int, payload: RiskApproval) -> dict[str, Any]:
+    actor = operator_name()
     with db() as connection:
         row = connection.execute("SELECT * FROM risk_evaluations WHERE id=?", (evaluation_id,)).fetchone()
         if not row:
@@ -870,10 +911,8 @@ def approve_risk_evaluation(evaluation_id: int, payload: RiskApproval, x_actor: 
 
 
 @app.post("/api/woocrm/risk-guard/evaluations/{evaluation_id}/reject")
-def reject_risk_evaluation(evaluation_id: int, payload: RiskApproval, x_actor: str | None = Header(None)) -> dict[str, Any]:
-    actor = (x_actor or payload.actor or "").strip()
-    if not actor:
-        raise HTTPException(401, "An authenticated actor is required to reject a change")
+def reject_risk_evaluation(evaluation_id: int, payload: RiskApproval) -> dict[str, Any]:
+    actor = operator_name()
     with db() as connection:
         if not connection.execute("SELECT 1 FROM risk_evaluations WHERE id=?", (evaluation_id,)).fetchone():
             raise HTTPException(404, "Risk evaluation not found")
@@ -930,6 +969,8 @@ def reconcile(dataset: str = Query("default")) -> SyncResult:
 
 @app.post("/api/woocrm/reset")
 def reset() -> dict[str, str]:
+    if not _is_true(os.getenv("DEMO_RESET_ENABLED"), default=app_env() == "demo"):
+        raise HTTPException(403, "Demo reset is disabled")
     with db() as connection:
         reset_data(connection)
     return {"message": "Demo data reset"}
