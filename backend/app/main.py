@@ -210,15 +210,12 @@ async def enforce_access_control(request: Request, call_next: Any) -> Any:
 
 
 @contextmanager
-def db() -> Any:
+def db(*, write: bool = False) -> Any:
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    # SQLite does not provide row-level locks.  Starting every write unit with
-    # an immediate transaction serializes check-then-create paths, so a retry
-    # cannot race another sync into creating a second record.
     connection = sqlite3.connect(DATABASE_PATH, timeout=10.0)
     connection.row_factory = sqlite3.Row
     try:
-        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
         yield connection
         connection.commit()
     except Exception:
@@ -333,7 +330,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
 
 
 def init_db() -> None:
-    with db() as connection:
+    with db(write=True) as connection:
         contact_schema = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='crm_contacts'"
         ).fetchone()
@@ -666,7 +663,7 @@ def reconcile_demo_contacts(connection: sqlite3.Connection, orders: list[sqlite3
 def run_sync(dataset: str = "default") -> SyncResult:
     if integration_mode() == "live":
         return run_live_sync(dataset)
-    with db() as connection:
+    with db(write=True) as connection:
         if dataset == "default":
             ensure_demo_contact_outcomes(connection)
         run_id = connection.execute("INSERT INTO sync_runs(dataset,started_at,status) VALUES (?,?,'running')", (dataset, now())).lastrowid
@@ -709,7 +706,7 @@ def run_live_sync(dataset: str) -> SyncResult:
             raise ConnectorError("CRM", f"Unsupported live CRM provider: {crm_provider()}")
         crm = HubSpotCRMAdapter()
     except ConnectorError as exc:
-        with db() as connection:
+        with db(write=True) as connection:
             run_id = connection.execute(
                 "INSERT INTO sync_runs(dataset,started_at,completed_at,status) VALUES (?,?,?,'error')",
                 (dataset, started, now()),
@@ -718,12 +715,34 @@ def run_live_sync(dataset: str) -> SyncResult:
         raise connector_failure(exc, "live reconciliation startup") from exc
 
     processed = skipped = 0
-    with db() as connection:
+    find_contact = getattr(crm, "find_contact", None)
+    verified_contacts: dict[str, dict[str, Any]] = {}
+    fetched: list[dict[str, Any]] = []
+    for order in orders:
+        checked = now()
+        normalized_email = normalize_email(order.customer_email)
+        if callable(find_contact) and normalized_email not in verified_contacts:
+            try:
+                contact = find_contact(normalized_email)
+            except ConnectorError as exc:
+                verified_contacts[normalized_email] = {"status": "LOOKUP_ERROR", "error": exc}
+                logger.warning("CRM contact lookup failed source=%s email=%s detail=%s",
+                               exc.source, normalized_email, _redact_secrets(str(exc)))
+            else:
+                verified_contacts[normalized_email] = {
+                    "status": "FOUND" if contact else "NOT_FOUND",
+                    "contact_id": str(contact.get("id")) if isinstance(contact, dict) and contact.get("id") else None,
+                }
+        try:
+            fetched.append({"order": order, "checked": checked, "crm": crm.find_order(order.id)})
+        except (ConnectorError, ValueError) as exc:
+            fetched.append({"order": order, "checked": checked, "error": exc})
+
+    with db(write=True) as connection:
         run_id = connection.execute("INSERT INTO sync_runs(dataset,started_at,status) VALUES (?,?,'running')", (dataset, started)).lastrowid
-        find_contact = getattr(crm, "find_contact", None)
-        verified_contacts: set[str] = set()
-        for order in orders:
-            checked = now()
+        for result in fetched:
+            order = result["order"]
+            checked = result["checked"]
             connection.execute(
                 """INSERT INTO orders(id,dataset,customer_email,customer_name,total,currency,status,created_at,source,environment,last_checked_at)
                    VALUES (?,?,?,?,?,?,?,?, 'woocommerce','live',?)
@@ -739,35 +758,21 @@ def run_live_sync(dataset: str) -> SyncResult:
                 skipped += 1
                 continue
             normalized_email = normalize_email(order.customer_email)
-            if callable(find_contact) and normalized_email not in verified_contacts:
-                verified_contacts.add(normalized_email)
-                try:
-                    contact = find_contact(normalized_email)
-                except ConnectorError as exc:
-                    connection.execute(
-                        """INSERT INTO crm_contacts(dataset,email,status,contact_id,verified_at,source)
-                           VALUES (?,?,?,?,?,'hubspot')
-                           ON CONFLICT(dataset,email) DO UPDATE SET status=excluded.status,
-                           contact_id=NULL,verified_at=excluded.verified_at,source=excluded.source""",
-                        (dataset, normalized_email, "LOOKUP_ERROR", None, now()),
-                    )
-                    logger.warning("CRM contact lookup failed source=%s email=%s detail=%s",
-                                   exc.source, normalized_email, _redact_secrets(str(exc)))
-                else:
-                    connection.execute(
-                        """INSERT INTO crm_contacts(dataset,email,status,contact_id,verified_at,source)
-                           VALUES (?,?,?,?,?,'hubspot')
-                           ON CONFLICT(dataset,email) DO UPDATE SET status=excluded.status,
-                           contact_id=excluded.contact_id,verified_at=excluded.verified_at,source=excluded.source""",
-                        (dataset, normalized_email, "FOUND" if contact else "NOT_FOUND",
-                         str(contact.get("id")) if isinstance(contact, dict) and contact.get("id") else None, now()),
-                    )
-            try:
-                found = crm.find_order(order.id)
+            contact = verified_contacts.get(normalized_email)
+            if contact:
+                error = contact.get("error")
+                connection.execute(
+                    """INSERT INTO crm_contacts(dataset,email,status,contact_id,verified_at,source)
+                       VALUES (?,?,?,?,?,'hubspot')
+                       ON CONFLICT(dataset,email) DO UPDATE SET status=excluded.status,
+                       contact_id=excluded.contact_id,verified_at=excluded.verified_at,source=excluded.source""",
+                    (dataset, normalized_email, contact["status"], contact.get("contact_id"), checked),
+                )
+            error = result.get("error")
+            if error is None:
+                found = result["crm"]
                 if found is None:
-                    connection.execute(
-                        """DELETE FROM crm_orders WHERE dataset=? AND order_id=?""", (dataset, order.id)
-                    )
+                    connection.execute("DELETE FROM crm_orders WHERE dataset=? AND order_id=?", (dataset, order.id))
                 else:
                     connection.execute(
                         """INSERT INTO crm_orders(dataset,order_id,email,name,total,currency,status,order_status,
@@ -785,9 +790,9 @@ def run_live_sync(dataset: str) -> SyncResult:
                 record_event(connection, dataset, order.id, "reconciliation", "completed",
                              f"Compared live WooCommerce and HubSpot values; result: {order_state(current, current_crm)}",
                              before_values=compared_values(current, current_crm))
-            except (ConnectorError, ValueError) as exc:
+            else:
                 message = _redact_secrets(
-                    f"{exc.source}: {exc}" if isinstance(exc, ConnectorError) else f"HubSpot: {exc}"
+                    f"{error.source}: {error}" if isinstance(error, ConnectorError) else f"HubSpot: {error}"
                 )
                 connection.execute(
                     """INSERT INTO crm_orders(dataset,order_id,email,name,total,currency,status,order_status,
@@ -950,7 +955,7 @@ def import_records(records: list[dict[str, Any]], source: str, dataset: str) -> 
     identifier_column = "id" if source == "woo" else "order_id"
     inserted = 0
     skipped = 0
-    with db() as connection:
+    with db(write=True) as connection:
         accepted: dict[str, dict[str, Any]] = {}
         for record in records:
             identifier = str(record["id"] if source == "woo" else record["order_id"])
@@ -1025,7 +1030,7 @@ def login(payload: LoginPayload) -> dict[str, str]:
 @app.get("/api/woocrm/ready")
 def ready() -> JSONResponse:
     try:
-        with db() as connection:
+        with db(write=True) as connection:
             connection.execute("SELECT 1").fetchone()
     except sqlite3.Error:
         return JSONResponse(status_code=503, content={"status": "unavailable"})
@@ -1120,7 +1125,7 @@ def update_risk_settings(payload: RiskSettingsPayload) -> dict[str, Any]:
         raise HTTPException(422, "percentage_total_change must be finite and non-negative")
     if payload.batch_change_limit < 1 or payload.newer_crm_policy not in {"review", "block"} or payload.missing_timestamp_policy not in {"review", "allow"}:
         raise HTTPException(422, "Risk settings contain unsupported values")
-    with db() as connection:
+    with db(write=True) as connection:
         connection.executemany(
             "INSERT OR REPLACE INTO risk_settings(key,value) VALUES (?,?)",
             [(key, str(value)) for key, value in payload.model_dump().items()],
@@ -1131,7 +1136,7 @@ def update_risk_settings(payload: RiskSettingsPayload) -> dict[str, Any]:
 @app.post("/api/woocrm/risk-guard/evaluations/{evaluation_id}/approve")
 def approve_risk_evaluation(evaluation_id: int, payload: RiskApproval) -> dict[str, Any]:
     actor = operator_name()
-    with db() as connection:
+    with db(write=True) as connection:
         row = connection.execute("SELECT * FROM risk_evaluations WHERE id=?", (evaluation_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Risk evaluation not found")
@@ -1147,7 +1152,7 @@ def approve_risk_evaluation(evaluation_id: int, payload: RiskApproval) -> dict[s
 @app.post("/api/woocrm/risk-guard/evaluations/{evaluation_id}/reject")
 def reject_risk_evaluation(evaluation_id: int, payload: RiskApproval) -> dict[str, Any]:
     actor = operator_name()
-    with db() as connection:
+    with db(write=True) as connection:
         if not connection.execute("SELECT 1 FROM risk_evaluations WHERE id=?", (evaluation_id,)).fetchone():
             raise HTTPException(404, "Risk evaluation not found")
         connection.execute("UPDATE risk_evaluations SET outcome='rejected',approval_actor=?,approval_at=? WHERE id=?", (actor, now(), evaluation_id))
@@ -1205,14 +1210,14 @@ def reconcile(dataset: str = Query("default")) -> SyncResult:
 def reset() -> dict[str, str]:
     if not _is_true(os.getenv("DEMO_RESET_ENABLED"), default=app_env() == "demo"):
         raise HTTPException(403, "Demo reset is disabled")
-    with db() as connection:
+    with db(write=True) as connection:
         reset_data(connection)
     return {"message": "Demo data reset"}
 
 
 @app.post("/api/woocrm/failure")
 def failure() -> dict[str, str]:
-    with db() as connection:
+    with db(write=True) as connection:
         row = connection.execute("SELECT * FROM crm_orders WHERE dataset='default' ORDER BY order_id DESC LIMIT 1").fetchone()
         if not row:
             raise HTTPException(409, "No CRM records available")
@@ -1254,7 +1259,7 @@ def find_order(connection: sqlite3.Connection, dataset: str, order_id: str) -> s
 
 def live_write_action(order_id: str, dataset: str, event_type: str, approval_id: int | None = None) -> dict[str, Any]:
     action_label = "Replay" if event_type == "replay" else "Mismatch correction"
-    with db() as connection:
+    with db(write=True) as connection:
         order = find_order(connection, dataset, order_id)
         if not order:
             raise HTTPException(404, "Order not found")
@@ -1363,7 +1368,7 @@ def replay(order_id: str, dataset: str = Query("default"), approval_id: int | No
         return live_write_action(order_id, dataset, "replay", approval_id)
     blocked_reason: str | None = None
     failure: HTTPException | None = None
-    with db() as connection:
+    with db(write=True) as connection:
         order = find_order(connection, dataset, order_id)
         if not order:
             raise HTTPException(404, "Order not found")
@@ -1407,7 +1412,7 @@ def update_mismatch(order_id: str, dataset: str = Query("default"), approval_id:
     if integration_mode() == "live":
         return live_write_action(order_id, dataset, "mismatch_correction", approval_id)
     try:
-        with db() as connection:
+        with db(write=True) as connection:
             order = find_order(connection, dataset, order_id)
             if not order:
                 raise HTTPException(404, "Order not found")
@@ -1427,12 +1432,12 @@ def update_mismatch(order_id: str, dataset: str = Query("default"), approval_id:
             )
         return {"state": "SYNCED", "message": f"CRM updated from WooCommerce for order {order_id} and verified"}
     except HTTPException as exc:
-        with db() as connection:
+        with db(write=True) as connection:
             if find_order(connection, dataset, order_id):
                 record_event(connection, dataset, order_id, "mismatch_correction", "failed", "Mismatch correction was not applied.", error_message=str(exc.detail))
         raise
     except RiskBlocked as exc:
-        with db() as connection:
+        with db(write=True) as connection:
             record_event(connection, dataset, order_id, "mismatch_correction", "blocked", "Mismatch correction was held by the risk guard.", error_message=str(exc))
         raise HTTPException(409, {"message": str(exc), "evaluation_id": exc.evaluation_id, "evaluation": exc.evaluation})
 
@@ -1441,7 +1446,7 @@ def update_mismatch(order_id: str, dataset: str = Query("default"), approval_id:
 def create_mismatch(order_id: str, dataset: str = Query("default")) -> dict[str, str]:
     if integration_mode() == "live":
         raise HTTPException(409, "Demo mismatch injection is unavailable in live mode")
-    with db() as connection:
+    with db(write=True) as connection:
         order = find_order(connection, dataset, order_id)
         if not order:
             raise HTTPException(404, "Order not found")
