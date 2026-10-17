@@ -1305,10 +1305,7 @@ def live_write_action(order_id: str, dataset: str, event_type: str, approval_id:
                 created_at=order["created_at"],
             )
             enforce_risk_guard(connection, order, external, approval_id)
-            try:
-                verified = crm_adapter.write_order(normalized, external)
-            except RiskBlocked as exc:
-                raise HTTPException(409, {"message": str(exc), "evaluation_id": exc.evaluation_id, "evaluation": exc.evaluation})
+            verified = crm_adapter.write_order(normalized, external)
             checked = now()
             connection.execute(
                 """INSERT INTO crm_orders(dataset,order_id,email,name,total,currency,status,order_status,
@@ -1334,6 +1331,12 @@ def live_write_action(order_id: str, dataset: str, event_type: str, approval_id:
             )
             return {"state": "SYNCED", "message": f"{action_label} completed for order {order_id} and verified"}
         except RiskBlocked as exc:
+            record_event(
+                connection, dataset, order_id, event_type, "blocked",
+                f"{action_label} was not run because the risk guard blocked it.",
+                error_message=str(exc),
+            )
+            connection.commit()
             raise HTTPException(409, {"message": str(exc), "evaluation_id": exc.evaluation_id, "evaluation": exc.evaluation})
         except (ConnectorError, ValueError) as exc:
             message = _redact_secrets(f"{exc.source}: {exc}" if isinstance(exc, ConnectorError) else str(exc))

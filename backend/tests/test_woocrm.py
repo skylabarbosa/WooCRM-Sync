@@ -747,6 +747,63 @@ def test_live_write_failure_persists_error_and_audit_records(monkeypatch):
     assert event["error_message"] == "HubSpot: simulated write failure"
 
 
+def test_risk_blocked_live_write_persists_evaluation_and_audit_event(monkeypatch):
+    reset()
+    monkeypatch.setenv("INTEGRATION_MODE", "live")
+    monkeypatch.setenv("CRM_PROVIDER", "hubspot")
+    monkeypatch.setenv("CRM_WRITE_ENABLED", "true")
+    monkeypatch.setenv("WOOCOMMERCE_STORE_URL", "https://shop.example")
+    monkeypatch.setenv("WOOCOMMERCE_CONSUMER_KEY", "key")
+    monkeypatch.setenv("WOOCOMMERCE_CONSUMER_SECRET", "secret")
+    monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", "token")
+    write_calls = []
+
+    class FakeWoo:
+        def list_orders(self):
+            return [NormalizedOrder("live-blocked", "blocked@example.com", "Blocked", 12, "USD", "processing", "2026-10-14T10:00:00Z")]
+
+        def test_connection(self):
+            return None
+
+    class FakeCRM:
+        def test_connection(self):
+            return None
+
+        def find_order(self, external_order_id):
+            return None
+
+        def write_order(self, order, existing=None):
+            write_calls.append(order.id)
+            raise AssertionError("Risk Guard should block before the CRM write")
+
+    monkeypatch.setattr(main, "WooCommerceClient", FakeWoo)
+    monkeypatch.setattr(main, "HubSpotCRMAdapter", FakeCRM)
+    assert client.post("/api/woocrm/reconcile").status_code == 200
+    with db() as connection:
+        connection.execute("UPDATE orders SET total=-1 WHERE id='live-blocked'")
+
+    response = client.post("/api/woocrm/orders/live-blocked/replay")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["evaluation"]["risk_status"] == "BLOCKED"
+    assert write_calls == []
+    with db() as connection:
+        evaluation = connection.execute(
+            "SELECT id,risk_status FROM risk_evaluations WHERE dataset='default' AND order_id='live-blocked'"
+        ).fetchone()
+        event = connection.execute(
+            "SELECT outcome,event_type,error_message FROM order_events "
+            "WHERE dataset='default' AND order_id='live-blocked' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert evaluation is not None
+    assert evaluation["risk_status"] == "BLOCKED"
+    assert dict(event) == {
+        "outcome": "blocked",
+        "event_type": "replay",
+        "error_message": response.json()["detail"]["message"],
+    }
+
+
 def test_reconciliation_does_not_repair_missing_records():
     dataset = f"rec-{uuid4().hex}"
     order = {
