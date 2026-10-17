@@ -55,6 +55,29 @@ def test_reconcile_identifies_missing_without_overwriting():
     assert payload["counts"]["MISSING"] == 4
 
 
+def test_demo_reconciliation_checks_every_eligible_contact_and_persists_outcomes():
+    reset()
+    assert client.post("/api/woocrm/reconcile").status_code == 200
+
+    payload = dashboard()
+    assert payload["contact_counts"] == {
+        "FOUND": 4,
+        "NOT_FOUND": 14,
+        "NOT_CHECKED": 0,
+        "LOOKUP_ERROR": 0,
+    }
+    assert all(
+        group["crm_contact_status"] in {"FOUND", "NOT_FOUND"}
+        for group in payload["groups"]
+    )
+    with db() as connection:
+        persisted = dict(connection.execute(
+            "SELECT email,status FROM crm_contacts WHERE dataset='default'"
+        ).fetchall())
+    assert len(persisted) == payload["eligible_customer_count"]
+    assert set(persisted.values()) == {"FOUND", "NOT_FOUND"}
+
+
 def test_replay_missing_order_is_idempotently_restricted():
     reset()
     assert client.post("/api/woocrm/orders/1009/replay").status_code == 200
@@ -229,12 +252,12 @@ def test_demo_reconciliation_backfills_missing_contact_outcomes_without_resettin
         ).fetchall())
     assert after_orders == before_orders
     assert sum(status == "FOUND" for status in statuses.values()) == 4
-    assert sum(status == "NOT_FOUND" for status in statuses.values()) == 2
-    assert len(statuses) == 6
+    assert sum(status == "NOT_FOUND" for status in statuses.values()) == 14
+    assert len(statuses) == 18
     payload = dashboard()
     assert payload["contact_counts"]["FOUND"] == 4
-    assert payload["contact_counts"]["NOT_FOUND"] == 2
-    assert payload["contact_counts"]["NOT_CHECKED"] == 12
+    assert payload["contact_counts"]["NOT_FOUND"] == 14
+    assert payload["contact_counts"]["NOT_CHECKED"] == 0
 
 
 def test_arbitrary_order_import_reconcile_replay_and_idempotency():

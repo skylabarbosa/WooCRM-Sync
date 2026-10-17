@@ -639,6 +639,30 @@ def ensure_demo_contact_outcomes(connection: sqlite3.Connection) -> None:
     )
 
 
+def reconcile_demo_contacts(connection: sqlite3.Connection, orders: list[sqlite3.Row]) -> None:
+    """Resolve every eligible demo customer against the seeded CRM contact set."""
+    demo_contacts = {
+        normalize_email(record["email"]): record
+        for record in seed_crm_contacts([dict(order) for order in orders])
+    }
+    checked_at = now()
+    checked_emails = {
+        normalize_email(order["customer_email"])
+        for order in orders
+        if eligible(order)
+    }
+    for email in checked_emails:
+        contact = demo_contacts.get(email)
+        connection.execute(
+            """INSERT INTO crm_contacts(dataset,email,status,contact_id,verified_at,source)
+               VALUES ('default',?,?,?,?, 'demo')
+               ON CONFLICT(dataset,email) DO UPDATE SET status=excluded.status,
+               contact_id=excluded.contact_id,verified_at=excluded.verified_at,source=excluded.source""",
+            (email, "FOUND" if contact and contact["status"] == "FOUND" else "NOT_FOUND",
+             contact.get("contact_id") if contact else None, checked_at),
+        )
+
+
 def run_sync(dataset: str = "default") -> SyncResult:
     if integration_mode() == "live":
         return run_live_sync(dataset)
@@ -647,6 +671,8 @@ def run_sync(dataset: str = "default") -> SyncResult:
             ensure_demo_contact_outcomes(connection)
         run_id = connection.execute("INSERT INTO sync_runs(dataset,started_at,status) VALUES (?,?,'running')", (dataset, now())).lastrowid
         orders = connection.execute("SELECT * FROM orders WHERE dataset=? ORDER BY id", (dataset,)).fetchall()
+        if dataset == "default":
+            reconcile_demo_contacts(connection, orders)
         touched: set[str] = set()
         skipped = 0
         for order in orders:
