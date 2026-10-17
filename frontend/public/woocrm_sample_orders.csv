@@ -1,0 +1,11 @@
+id,customer_email,customer_name,total,currency,status,created_at
+2001,alex.morgan@example.com,Alex Morgan,129.0,USD,processing,2026-10-01T10:30:00
+2002,jamie.lee@example.com,Jamie Lee,82.5,USD,completed,2026-10-02T11:15:00
+2003,taylor.reed@example.com,Taylor Reed,45.0,USD,processing,2026-10-03T14:20:00
+2004,casey.patel@example.com,Casey Patel,210.0,USD,completed,2026-10-04T09:45:00
+2005,morgan.chen@example.com,Morgan Chen,67.0,EUR,processing,2026-10-05T16:10:00
+2006,riley.brown@example.com,Riley Brown,315.0,USD,completed,2026-10-06T12:00:00
+2007,jordan.martin@example.com,Jordan Martin,99.0,USD,processing,2026-10-07T13:25:00
+2008,harper.lee@example.com,Harper Lee,156.0,USD,completed,2026-10-08T15:40:00
+2009,jackson.reed@example.com,Jackson Reed,74.0,USD,processing,2026-10-09T08:55:00
+2010,isla.morgan@example.com,Isla Morgan,188.0,USD,completed,2026-10-10T17:05:00

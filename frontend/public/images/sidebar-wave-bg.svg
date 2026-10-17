@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 850" preserveAspectRatio="none" width="100%" height="100%">
+  <defs>
+    <!-- Base Background Gradient -->
+    <linearGradient id="baseGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#081432" />
+      <stop offset="35%" stop-color="#0A183C" />
+      <stop offset="65%" stop-color="#07122A" />
+      <stop offset="100%" stop-color="#050C1E" />
+    </linearGradient>
+
+    <!-- Upper Wave Dark Indigo/Blue Gradient -->
+    <linearGradient id="wave1Grad" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#182E62" />
+      <stop offset="45%" stop-color="#12244E" />
+      <stop offset="100%" stop-color="#0A1838" />
+    </linearGradient>
+
+    <!-- Vibrant Purple/Violet Ribbon Gradient -->
+    <linearGradient id="purpleRibbon" x1="100%" y1="10%" x2="0%" y2="90%">
+      <stop offset="0%" stop-color="#1E1B58" stop-opacity="0.2" />
+      <stop offset="35%" stop-color="#4F1E7E" stop-opacity="0.85" />
+      <stop offset="60%" stop-color="#6B21A8" stop-opacity="0.9" />
+      <stop offset="85%" stop-color="#3B1869" stop-opacity="0.8" />
+      <stop offset="100%" stop-color="#171A4E" stop-opacity="0.1" />
+    </linearGradient>
+
+    <!-- Deep Blue Underwave Gradient -->
+    <linearGradient id="blueUnderwave" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%" stop-color="#103A82" stop-opacity="0.85" />
+      <stop offset="40%" stop-color="#18499B" stop-opacity="0.75" />
+      <stop offset="75%" stop-color="#1A2D6E" stop-opacity="0.4" />
+      <stop offset="100%" stop-color="#0C1B3F" stop-opacity="0" />
+    </linearGradient>
+
+    <!-- Subtle Wave Highlight Rim -->
+    <linearGradient id="rimGlow" x1="100%" y1="20%" x2="0%" y2="80%">
+      <stop offset="0%" stop-color="#60A5FA" stop-opacity="0" />
+      <stop offset="40%" stop-color="#818CF8" stop-opacity="0.5" />
+      <stop offset="70%" stop-color="#A855F7" stop-opacity="0.6" />
+      <stop offset="100%" stop-color="#3B82F6" stop-opacity="0.2" />
+    </linearGradient>
+
+    <!-- Ambient glow filter -->
+    <filter id="softBlur" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="24" />
+    </filter>
+  </defs>
+
+  <!-- Background Base -->
+  <rect width="240" height="850" fill="url(#baseGrad)" />
+
+  <!-- Ambient background glow spots (subtle depth) -->
+  <circle cx="120" cy="580" r="140" fill="#4C1D95" opacity="0.25" filter="url(#softBlur)" />
+  <circle cx="30" cy="640" r="110" fill="#1D4ED8" opacity="0.3" filter="url(#softBlur)" />
+
+  <!-- Wave 1: Smooth sweeping dark blue diagonal wave from right to bottom-left -->
+  <path d="M 240,280 C 240,360 170,440 100,520 C 50,578 10,610 0,630 L 0,850 L 240,850 Z" 
+        fill="url(#wave1Grad)" />
+
+  <!-- Wave 2: Purple / Violet luminous ribbon -->
+  <path d="M 240,430 C 190,480 140,540 85,590 C 35,635 10,655 0,668 L 0,720 C 20,705 55,675 110,630 C 160,590 205,530 240,475 Z" 
+        fill="url(#purpleRibbon)" />
+
+  <!-- Wave 3: Blue underwave sweep along the bottom left -->
+  <path d="M 0,620 C 25,605 60,580 95,550 C 60,600 25,650 0,685 Z" 
+        fill="url(#blueUnderwave)" />
+
+  <!-- Fine glowing edge accent line -->
+  <path d="M 240,430 C 190,480 140,540 85,590 C 35,635 10,655 0,668" 
+        fill="none" stroke="url(#rimGlow)" stroke-width="1.8" opacity="0.8" />
+
+  <!-- Subtle lower arc highlight -->
+  <path d="M 240,475 C 205,530 160,590 110,630 C 55,675 20,705 0,720" 
+        fill="none" stroke="#6366F1" stroke-width="1.2" opacity="0.35" />
+
+</svg>

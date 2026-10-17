@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import csv
+import io
+import json
+import math
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -7,14 +11,31 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from app.risk_guard import RiskSettings, evaluate_batch, evaluate_change
+
+from app.connectors import (
+    ConnectorError,
+    HubSpotCRMAdapter,
+    NormalizedOrder,
+    WooCommerceClient,
+    connector_status,
+    crm_provider,
+    integration_mode,
+    writes_enabled,
+)
+from app.seed_data import seed_crm_contacts, seed_crm_orders, seed_orders
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", BASE_DIR / "woocrm.db"))
+ELIGIBLE_STATUSES = {"processing", "completed"}
+ORDER_STATUSES = {"pending", "processing", "on-hold", "completed", "cancelled", "failed", "refunded", "checkout-draft"}
+CRM_STATUSES = {"SYNCED", "ERROR"}
+STATES = {"SYNCED", "MISSING", "MISMATCH", "ERROR", "NOT_ELIGIBLE"}
 
-app = FastAPI(title="WooCRM Sync", version="0.1.0")
+app = FastAPI(title="WooCRM Sync", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -32,6 +53,9 @@ def db() -> Any:
     try:
         yield connection
         connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
     finally:
         connection.close()
 
@@ -40,92 +64,351 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def seed_orders() -> list[dict[str, Any]]:
-    customers = [
-        ("maya@example.com", "Maya Chen", "maya@example.com"),
-        ("liam@example.com", "Liam Carter", "liam@example.com"),
-        ("sofia@example.com", "Sofia Rossi", "sofia@example.com"),
-        ("noah@example.com", "Noah Williams", "noah@example.com"),
-        ("maya@example.com", "Maya Chen", "maya@example.com"),
-        ("ava@example.com", "Ava Patel", "ava@example.com"),
-        ("liam@example.com", "Liam Carter", "liam@example.com"),
-        ("ethan@example.com", "Ethan Brown", "ethan@example.com"),
-        ("sofia@example.com", "Sofia Rossi", "sofia@example.com"),
-        ("olivia@example.com", "Olivia Martin", "olivia@example.com"),
-    ]
-    statuses = ["processing", "completed", "pending", "processing", "completed", "completed", "cancelled", "processing", "completed", "on-hold"]
-    return [
-        {
-            "id": index + 1001,
-            "customer_email": email,
-            "customer_name": name,
-            "total": float([129, 82.5, 45, 210, 67, 315, 99, 156, 74, 188][index]),
-            "currency": "USD",
-            "status": statuses[index],
-            "created_at": f"2026-10-{index + 1:02d}T10:00:00Z",
-        }
-        for index, (email, name, _) in enumerate(customers)
-    ]
+def normalize_email(value: str) -> str:
+    return value.strip().lower()
+
+
+def eligible(order: sqlite3.Row) -> bool:
+    return order["status"] in ELIGIBLE_STATUSES
+
+
+def order_state(order: sqlite3.Row, crm: sqlite3.Row | None) -> str:
+    if not eligible(order):
+        return "NOT_ELIGIBLE"
+    if crm is None:
+        return "MISSING"
+    if crm["status"] == "ERROR":
+        return "ERROR"
+    values = (
+        abs(float(crm["total"]) - float(order["total"])) < 0.001,
+        crm["currency"] == order["currency"],
+        crm["order_status"] == order["status"],
+        normalize_email(crm["email"]) == normalize_email(order["customer_email"]),
+    )
+    return "SYNCED" if all(values) else "MISMATCH"
+
+
+def _create_schema(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS orders (
+          id TEXT NOT NULL,
+          dataset TEXT NOT NULL DEFAULT 'default',
+          customer_email TEXT NOT NULL, customer_name TEXT NOT NULL,
+          total REAL NOT NULL, currency TEXT NOT NULL, status TEXT NOT NULL,
+          created_at TEXT NOT NULL, modified_at TEXT, source TEXT NOT NULL DEFAULT 'demo',
+          environment TEXT NOT NULL DEFAULT 'demo', last_checked_at TEXT,
+          PRIMARY KEY (dataset, id)
+        );
+        CREATE TABLE IF NOT EXISTS customers (
+          dataset TEXT NOT NULL DEFAULT 'default', email TEXT NOT NULL, name TEXT NOT NULL,
+          order_count INTEGER NOT NULL DEFAULT 0, lifetime_value REAL NOT NULL DEFAULT 0,
+          crm_id TEXT, last_synced_at TEXT, PRIMARY KEY (dataset, email)
+        );
+        CREATE TABLE IF NOT EXISTS crm_orders (
+          dataset TEXT NOT NULL DEFAULT 'default', order_id TEXT NOT NULL,
+          email TEXT NOT NULL, name TEXT NOT NULL, total REAL NOT NULL,
+          currency TEXT NOT NULL, status TEXT NOT NULL, order_status TEXT,
+          error_message TEXT, updated_at TEXT, source TEXT NOT NULL DEFAULT 'demo',
+          environment TEXT NOT NULL DEFAULT 'demo', last_checked_at TEXT,
+          PRIMARY KEY (dataset, order_id)
+        );
+        CREATE TABLE IF NOT EXISTS crm_contacts (
+          dataset TEXT NOT NULL DEFAULT 'default', email TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('FOUND', 'NOT_FOUND')),
+          contact_id TEXT, verified_at TEXT NOT NULL, source TEXT NOT NULL,
+          PRIMARY KEY (dataset, email)
+        );
+        CREATE TABLE IF NOT EXISTS sync_runs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, dataset TEXT NOT NULL DEFAULT 'default',
+          started_at TEXT NOT NULL, completed_at TEXT, processed INTEGER NOT NULL DEFAULT 0,
+          created INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL DEFAULT 0,
+          skipped INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS order_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          dataset TEXT NOT NULL DEFAULT 'default',
+          order_id TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          outcome TEXT NOT NULL,
+          message TEXT NOT NULL,
+          error_message TEXT,
+          before_values TEXT,
+          after_values TEXT,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS risk_settings (
+          key TEXT PRIMARY KEY, value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS risk_evaluations (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, dataset TEXT NOT NULL, order_id TEXT NOT NULL,
+          field TEXT NOT NULL, risk_status TEXT NOT NULL, rule_ids TEXT NOT NULL,
+          explanation TEXT NOT NULL, existing_value TEXT, proposed_value TEXT,
+          evidence TEXT NOT NULL, required_action TEXT NOT NULL, evaluated_at TEXT NOT NULL,
+          fingerprint TEXT NOT NULL, approved INTEGER NOT NULL DEFAULT 0,
+          approval_actor TEXT, approval_at TEXT, outcome TEXT NOT NULL DEFAULT 'flagged'
+        );
+        """
+    )
+    for table in ("orders", "crm_orders"):
+        columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+        for column, definition in (
+            ("modified_at", "TEXT"),
+            ("source", "TEXT NOT NULL DEFAULT 'demo'"),
+            ("environment", "TEXT NOT NULL DEFAULT 'demo'"),
+            ("last_checked_at", "TEXT"),
+        ):
+            if column not in columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def init_db() -> None:
     with db() as connection:
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS orders (
-                id INTEGER PRIMARY KEY, customer_email TEXT NOT NULL, customer_name TEXT NOT NULL,
-                total REAL NOT NULL, currency TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS customers (
-                email TEXT PRIMARY KEY, name TEXT NOT NULL, order_count INTEGER NOT NULL DEFAULT 0,
-                lifetime_value REAL NOT NULL DEFAULT 0, crm_id TEXT, last_synced_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS sync_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, completed_at TEXT,
-                processed INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL DEFAULT 0,
-                updated INTEGER NOT NULL DEFAULT 0, skipped INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'running'
-            );
-            """
+        tables = {row["name"] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        migrated_tables: set[str] = set()
+        for table in ("orders", "crm_orders", "customers", "sync_runs"):
+            if table in tables:
+                columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+                if "dataset" not in columns:
+                    connection.execute(f"ALTER TABLE {table} RENAME TO legacy_{table}")
+                    migrated_tables.add(table)
+        _create_schema(connection)
+        connection.executemany(
+            "INSERT OR IGNORE INTO risk_settings(key,value) VALUES (?,?)",
+            [
+                ("absolute_total_change", "100"),
+                ("percentage_total_change", "50"),
+                ("batch_change_limit", "25"),
+                ("newer_crm_policy", "review"),
+                ("missing_timestamp_policy", "review"),
+            ],
         )
-        if connection.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0:
-            connection.executemany(
-                "INSERT INTO orders VALUES (:id,:customer_email,:customer_name,:total,:currency,:status,:created_at)",
-                seed_orders(),
+        if "orders" in migrated_tables:
+            connection.execute(
+                """INSERT OR IGNORE INTO orders(id,customer_email,customer_name,total,currency,status,created_at)
+                   SELECT CAST(id AS TEXT),customer_email,customer_name,total,currency,status,created_at FROM legacy_orders"""
             )
-        if connection.execute("SELECT COUNT(*) FROM customers").fetchone()[0] == 0:
-            connection.executemany(
-                "INSERT INTO customers(email,name,order_count,lifetime_value) VALUES (?,?,?,?)",
-                [
-                    ("maya@example.com", "Maya Chen", 2, 196),
-                    ("liam@example.com", "Liam Carter", 1, 82.5),
-                    ("legacy@example.com", "Legacy Contact", 0, 0),
-                ],
+            connection.execute(
+                """INSERT OR IGNORE INTO crm_orders(dataset,order_id,email,name,total,currency,status,order_status,error_message,updated_at)
+                   SELECT 'default',CAST(order_id AS TEXT),email,name,total,currency,status,order_status,error_message,updated_at
+                   FROM legacy_crm_orders"""
             )
+        if "customers" in migrated_tables:
+            connection.execute(
+                """INSERT OR IGNORE INTO customers(dataset,email,name,order_count,lifetime_value,crm_id,last_synced_at)
+                   SELECT 'default',email,name,order_count,lifetime_value,crm_id,last_synced_at FROM legacy_customers"""
+            )
+        if "sync_runs" in migrated_tables:
+            connection.execute(
+                """INSERT OR IGNORE INTO sync_runs(id,dataset,started_at,completed_at,processed,created,updated,skipped,status)
+                   SELECT id,'default',started_at,completed_at,processed,created,updated,skipped,status FROM legacy_sync_runs"""
+            )
+        for table in migrated_tables:
+            connection.execute(f"DROP TABLE legacy_{table}")
+        if connection.execute("SELECT COUNT(*) FROM orders WHERE dataset='default'").fetchone()[0] == 0:
+            reset_data(connection)
 
 
-def eligible(order: sqlite3.Row) -> bool:
-    return order["status"] in {"processing", "completed"} and order["total"] > 0
+def reset_data(connection: sqlite3.Connection) -> None:
+    connection.execute("DELETE FROM orders WHERE dataset='default'")
+    connection.execute("DELETE FROM customers WHERE dataset='default'")
+    connection.execute("DELETE FROM crm_orders WHERE dataset='default'")
+    connection.execute("DELETE FROM crm_contacts WHERE dataset='default'")
+    connection.execute("DELETE FROM sync_runs WHERE dataset='default'")
+    connection.execute("DELETE FROM order_events WHERE dataset='default'")
+    connection.execute("DELETE FROM risk_evaluations WHERE dataset='default'")
+    connection.execute("DELETE FROM risk_settings WHERE key LIKE 'demo_%'")
+    orders = seed_orders()
+    connection.executemany(
+        """INSERT INTO orders(id,dataset,customer_email,customer_name,total,currency,status,created_at,modified_at)
+           VALUES (:id,'default',:customer_email,:customer_name,:total,:currency,:status,:created_at,:modified_at)""",
+        orders,
+    )
+    connection.executemany(
+        "INSERT INTO customers(dataset,email,name) VALUES (?,?,?)",
+        [("default", order["customer_email"], order["customer_name"]) for order in orders],
+    )
+    connection.executemany(
+        """INSERT INTO crm_contacts(dataset,email,status,contact_id,verified_at,source)
+           VALUES ('default',:email,:status,:contact_id,:verified_at,:source)""",
+        seed_crm_contacts(orders),
+    )
+    connection.executemany(
+        """INSERT INTO crm_orders(dataset,order_id,email,name,total,currency,status,order_status,error_message,updated_at)
+           VALUES ('default',:order_id,:email,:name,:total,:currency,:status,:order_status,:error_message,:updated_at)""",
+        [{**record, "error_message": record.get("error_message"), "updated_at": record.get("updated_at", now())} for record in seed_crm_orders(orders)],
+    )
+    connection.execute(
+        "INSERT INTO sync_runs(dataset,started_at,completed_at,processed,created,updated,skipped,status) VALUES ('default','2026-10-14T16:00:00Z','2026-10-14T16:00:08Z',20,0,0,2,'completed')"
+    )
+    events = [
+        ("1001", "reconciliation", "verified", "Demo order matched WooCommerce and CRM values.", None),
+        ("1016", "replay", "failed", "Recovery attempt timed out at the CRM connector.", "Demo connector timeout"),
+        ("1016", "reconciliation", "verified", "Later verification confirmed the connector recovered.", None),
+        ("1013", "mismatch_correction", "completed", "A previously reviewed CRM mismatch was resolved.", None),
+        ("1018", "replay", "failed", "First recovery attempt returned a transient timeout.", "Transient demo timeout"),
+        ("1018", "reconciliation", "verified", "Later verification confirmed the order is synchronized.", None),
+    ]
+    connection.executemany(
+        """INSERT INTO order_events(dataset,order_id,event_type,outcome,message,error_message,created_at)
+           VALUES ('default',?,?,?,?,?,?)""",
+        [(order_id, event_type, outcome, message, error, f"2026-10-14T16:{index + 10:02d}:00Z")
+         for index, (order_id, event_type, outcome, message, error) in enumerate(events)],
+    )
+    demo_evaluations = [
+        ("1013", "REVIEW_REQUIRED", ["LARGE_TOTAL_CHANGE"], "Total differs from CRM by more than the configured threshold."),
+        ("1014", "REVIEW_REQUIRED", ["LARGE_TOTAL_CHANGE"], "CRM contains a reviewed total difference."),
+        ("1015", "REVIEW_REQUIRED", ["LARGE_TOTAL_CHANGE"], "Large order change requires manual review."),
+        ("__BATCH__", "REVIEW_REQUIRED", ["BULK_CHANGE_ANOMALY"], "Demo batch exceeds the configured change threshold."),
+    ]
+    for order_id, status, rule_ids, explanation in demo_evaluations:
+        connection.execute(
+            """INSERT INTO risk_evaluations(dataset,order_id,field,risk_status,rule_ids,explanation,
+               existing_value,proposed_value,evidence,required_action,evaluated_at,fingerprint,outcome)
+               VALUES ('default',?,'order',?,?,?,?,?,?,?,?,?,'flagged')""",
+            (order_id, status, json.dumps(rule_ids), json.dumps([explanation]), json.dumps(None),
+             json.dumps(None), json.dumps({"demo": True}), "block" if status == "BLOCKED" else "request_confirmation",
+             "2026-10-14T16:00:00Z", f"demo-{order_id}"),
+        )
 
 
-def snapshot() -> dict[str, Any]:
-    with db() as connection:
-        orders = [dict(row) for row in connection.execute("SELECT * FROM orders ORDER BY id")]
-        customers = [dict(row) for row in connection.execute("SELECT * FROM customers ORDER BY name")]
-        last_run = connection.execute("SELECT * FROM sync_runs ORDER BY id DESC LIMIT 1").fetchone()
-    eligible_orders = [order for order in orders if order["status"] in {"processing", "completed"} and order["total"] > 0]
-    groups: dict[str, dict[str, Any]] = {}
-    for order in eligible_orders:
-        group = groups.setdefault(order["customer_email"], {"email": order["customer_email"], "name": order["customer_name"], "order_count": 0, "lifetime_value": 0})
-        group["order_count"] += 1
-        group["lifetime_value"] += order["total"]
+def refresh_customer(connection: sqlite3.Connection, dataset: str, email: str, timestamp: str) -> None:
+    normalized = normalize_email(email)
+    rows = connection.execute(
+        "SELECT * FROM orders WHERE dataset=? AND lower(trim(customer_email))=? AND status IN ('processing','completed')",
+        (dataset, normalized),
+    ).fetchall()
+    if not rows:
+        return
+    connection.execute(
+        """INSERT INTO customers(dataset,email,name,order_count,lifetime_value,crm_id,last_synced_at)
+           VALUES (?,?,?,?,?,?,?) ON CONFLICT(dataset,email) DO UPDATE SET name=excluded.name,
+           order_count=excluded.order_count,lifetime_value=excluded.lifetime_value,
+           last_synced_at=excluded.last_synced_at""",
+        (dataset, normalized, rows[0]["customer_name"], len(rows), sum(row["total"] for row in rows),
+         None, timestamp),
+    )
+
+
+def sync_order(connection: sqlite3.Connection, order: sqlite3.Row, approval_id: int | None = None) -> str:
+    if not eligible(order):
+        return "NOT_ELIGIBLE"
+    crm = connection.execute(
+        "SELECT * FROM crm_orders WHERE dataset=? AND order_id=?", (order["dataset"], order["id"])
+    ).fetchone()
+    enforce_risk_guard(connection, order, crm, approval_id)
+    timestamp = now()
+    connection.execute(
+        """INSERT INTO crm_orders(dataset,order_id,email,name,total,currency,status,order_status,updated_at)
+           VALUES (?,?,?,?,?,?, 'SYNCED',?,?) ON CONFLICT(dataset,order_id) DO UPDATE SET
+           email=excluded.email,name=excluded.name,total=excluded.total,currency=excluded.currency,
+           status='SYNCED',order_status=excluded.order_status,error_message=NULL,updated_at=excluded.updated_at""",
+        (order["dataset"], order["id"], normalize_email(order["customer_email"]), order["customer_name"],
+         order["total"], order["currency"], order["status"], timestamp),
+    )
+    refresh_customer(connection, order["dataset"], order["customer_email"], timestamp)
+    return "SYNCED"
+
+
+def compared_values(order: sqlite3.Row, crm: sqlite3.Row | None) -> dict[str, Any]:
     return {
-        "orders": orders,
-        "customers": customers,
-        "eligible_order_count": len(eligible_orders),
-        "eligible_customer_count": len(groups),
-        "last_run": dict(last_run) if last_run else None,
+        "billing_email": order["customer_email"],
+        "total": order["total"],
+        "currency": order["currency"],
+        "order_status": order["status"],
+    } if crm is None else {
+        "billing_email": crm["email"],
+        "total": crm["total"],
+        "currency": crm["currency"],
+        "order_status": crm["order_status"],
     }
+
+
+def record_event(
+    connection: sqlite3.Connection,
+    dataset: str,
+    order_id: str,
+    event_type: str,
+    outcome: str,
+    message: str,
+    *,
+    error_message: str | None = None,
+    before_values: dict[str, Any] | None = None,
+    after_values: dict[str, Any] | None = None,
+) -> None:
+    connection.execute(
+        """INSERT INTO order_events(dataset,order_id,event_type,outcome,message,error_message,
+           before_values,after_values,created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
+        (dataset, str(order_id), event_type, outcome, message, error_message,
+         json.dumps(before_values) if before_values is not None else None,
+         json.dumps(after_values) if after_values is not None else None, now()),
+    )
+
+
+class RiskBlocked(RuntimeError):
+    def __init__(self, evaluation_id: int, evaluation: dict[str, Any]) -> None:
+        super().__init__(f"Risk guard requires review ({evaluation_id})")
+        self.evaluation_id = evaluation_id
+        self.evaluation = evaluation
+
+
+def risk_settings(connection: sqlite3.Connection) -> RiskSettings:
+    values = {row["key"]: row["value"] for row in connection.execute("SELECT key,value FROM risk_settings")}
+    try:
+        return RiskSettings(
+            absolute_total_change=float(values.get("absolute_total_change", 100)),
+            percentage_total_change=float(values.get("percentage_total_change", 50)),
+            batch_change_limit=int(values.get("batch_change_limit", 25)),
+            newer_crm_policy=values.get("newer_crm_policy", "review"),
+            missing_timestamp_policy=values.get("missing_timestamp_policy", "review"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(500, "Risk guard settings are invalid") from exc
+
+
+def persist_evaluation(connection: sqlite3.Connection, dataset: str, evaluation: dict[str, Any]) -> int:
+    cursor = connection.execute(
+        """INSERT INTO risk_evaluations(dataset,order_id,field,risk_status,rule_ids,explanation,
+           existing_value,proposed_value,evidence,required_action,evaluated_at,fingerprint)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            dataset, evaluation["order_id"], evaluation["field"], evaluation["risk_status"],
+            json.dumps(evaluation["rule_ids"]), json.dumps([r["explanation"] for r in evaluation["rules"]]),
+            json.dumps(evaluation["existing_value"]), json.dumps(evaluation["proposed_value"]),
+            json.dumps(evaluation.get("evidence", evaluation["rules"])), evaluation["required_action"], now(),
+            evaluation["fingerprint"],
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def evaluation_payload(row: sqlite3.Row) -> dict[str, Any]:
+    result = dict(row)
+    for key in ("rule_ids", "explanation", "existing_value", "proposed_value", "evidence"):
+        result[key] = json.loads(result[key])
+    result["approved"] = bool(result["approved"])
+    return result
+
+
+def enforce_risk_guard(
+    connection: sqlite3.Connection, order: sqlite3.Row, crm: sqlite3.Row | None, approval_id: int | None = None,
+) -> dict[str, Any]:
+    evaluation = evaluate_change(order, crm, risk_settings(connection))
+    evaluation_id = persist_evaluation(connection, order["dataset"], evaluation)
+    if evaluation["risk_status"] == "CLEAR":
+        return evaluation
+    if evaluation["risk_status"] == "BLOCKED":
+        connection.commit()
+        raise RiskBlocked(evaluation_id, evaluation)
+    if approval_id is not None:
+        approved = connection.execute(
+            "SELECT * FROM risk_evaluations WHERE id=? AND dataset=? AND order_id=? AND approved=1",
+            (approval_id, order["dataset"], str(order["id"])),
+        ).fetchone()
+        if approved and approved["fingerprint"] == evaluation["fingerprint"]:
+            return evaluation
+    connection.commit()
+    raise RiskBlocked(evaluation_id, evaluation)
 
 
 class SyncResult(BaseModel):
@@ -137,43 +420,329 @@ class SyncResult(BaseModel):
     message: str
 
 
-def run_sync() -> SyncResult:
-    started = now()
+class RiskSettingsPayload(BaseModel):
+    absolute_total_change: float
+    percentage_total_change: float
+    batch_change_limit: int
+    newer_crm_policy: str = "review"
+    missing_timestamp_policy: str = "review"
+
+
+class RiskApproval(BaseModel):
+    actor: str = "operator"
+
+
+class RiskBatchPayload(BaseModel):
+    order_ids: list[str]
+
+
+def run_sync(dataset: str = "default") -> SyncResult:
+    if integration_mode() == "live":
+        return run_live_sync(dataset)
     with db() as connection:
-        cursor = connection.execute("INSERT INTO sync_runs(started_at) VALUES (?)", (started,))
-        run_id = cursor.lastrowid
-        orders = connection.execute("SELECT * FROM orders ORDER BY id").fetchall()
-        groups: dict[str, dict[str, Any]] = {}
+        run_id = connection.execute("INSERT INTO sync_runs(dataset,started_at,status) VALUES (?,?,'running')", (dataset, now())).lastrowid
+        orders = connection.execute("SELECT * FROM orders WHERE dataset=? ORDER BY id", (dataset,)).fetchall()
+        touched: set[str] = set()
         skipped = 0
         for order in orders:
-            if not eligible(order):
-                skipped += 1
-                continue
-            group = groups.setdefault(order["customer_email"], {"name": order["customer_name"], "order_count": 0, "lifetime_value": 0})
-            group["order_count"] += 1
-            group["lifetime_value"] += order["total"]
-        created = updated = 0
-        for email, group in groups.items():
-            existing = connection.execute("SELECT * FROM customers WHERE email=?", (email,)).fetchone()
-            if existing:
-                changed = existing["order_count"] != group["order_count"] or abs(existing["lifetime_value"] - group["lifetime_value"]) > 0.001 or existing["name"] != group["name"]
-                connection.execute(
-                    "UPDATE customers SET name=?,order_count=?,lifetime_value=?,crm_id=COALESCE(crm_id,?),last_synced_at=? WHERE email=?",
-                    (group["name"], group["order_count"], group["lifetime_value"], f"crm_{email.split('@')[0]}", started, email),
-                )
-                updated += int(changed)
+            if eligible(order):
+                touched.add(order["customer_email"])
             else:
-                connection.execute(
-                    "INSERT INTO customers(email,name,order_count,lifetime_value,crm_id,last_synced_at) VALUES (?,?,?,?,?,?)",
-                    (email, group["name"], group["order_count"], group["lifetime_value"], f"crm_{email.split('@')[0]}", started),
-                )
-                created += 1
+                skipped += 1
+            if eligible(order):
+                refresh_customer(connection, dataset, order["customer_email"], now())
+            crm = connection.execute(
+                "SELECT * FROM crm_orders WHERE dataset=? AND order_id=?", (dataset, order["id"])
+            ).fetchone()
+            record_event(
+                connection, dataset, order["id"], "reconciliation", "completed",
+                f"Compared WooCommerce and CRM values; result: {order_state(order, crm)}",
+                before_values=compared_values(order, crm),
+            )
         processed = len(orders)
         connection.execute(
-            "UPDATE sync_runs SET completed_at=?,processed=?,created=?,updated=?,skipped=?,status='completed' WHERE id=?",
-            (now(), processed, created, updated, skipped, run_id),
+            "UPDATE sync_runs SET completed_at=?,processed=?,created=0,updated=0,skipped=?,status='completed' WHERE id=?",
+            (now(), processed, skipped, run_id),
         )
-    return SyncResult(run_id=run_id, processed=processed, created=created, updated=updated, skipped=skipped, message="Sync completed idempotently")
+    return SyncResult(run_id=run_id, processed=processed, created=0, updated=0, skipped=skipped,
+                      message="Reconciliation completed; mismatches require explicit update")
+
+
+def run_live_sync(dataset: str) -> SyncResult:
+    """Fetch both external systems and reconcile only the selected dataset."""
+    started = now()
+    try:
+        woo = WooCommerceClient()
+        orders = woo.list_orders()
+        if crm_provider() != "hubspot":
+            raise ConnectorError("CRM", f"Unsupported live CRM provider: {crm_provider()}")
+        crm = HubSpotCRMAdapter()
+    except ConnectorError as exc:
+        with db() as connection:
+            run_id = connection.execute(
+                "INSERT INTO sync_runs(dataset,started_at,completed_at,status) VALUES (?,?,?,'error')",
+                (dataset, started, now()),
+            ).lastrowid
+            record_event(connection, dataset, "*", "reconciliation", "failed", "Live reconciliation could not start.", error_message=f"{exc.source}: {exc}")
+        raise HTTPException(502, f"{exc.source}: {exc}") from exc
+
+    processed = skipped = 0
+    with db() as connection:
+        run_id = connection.execute("INSERT INTO sync_runs(dataset,started_at,status) VALUES (?,?,'running')", (dataset, started)).lastrowid
+        find_contact = getattr(crm, "find_contact", None)
+        verified_contacts: set[str] = set()
+        for order in orders:
+            checked = now()
+            connection.execute(
+                """INSERT INTO orders(id,dataset,customer_email,customer_name,total,currency,status,created_at,source,environment,last_checked_at)
+                   VALUES (?,?,?,?,?,?,?,?, 'woocommerce','live',?)
+                   ON CONFLICT(dataset,id) DO UPDATE SET customer_email=excluded.customer_email,
+                   customer_name=excluded.customer_name,total=excluded.total,currency=excluded.currency,
+                   status=excluded.status,created_at=excluded.created_at,source='woocommerce',
+                   environment='live',last_checked_at=excluded.last_checked_at""",
+                (order.id, dataset, order.customer_email, order.customer_name, order.total, order.currency,
+                 order.status, order.created_at, checked),
+            )
+            processed += 1
+            if not eligible(connection.execute("SELECT * FROM orders WHERE dataset=? AND id=?", (dataset, order.id)).fetchone()):
+                skipped += 1
+                continue
+            normalized_email = normalize_email(order.customer_email)
+            if callable(find_contact) and normalized_email not in verified_contacts:
+                verified_contacts.add(normalized_email)
+                try:
+                    contact = find_contact(normalized_email)
+                except ConnectorError:
+                    contact = None
+                else:
+                    connection.execute(
+                        """INSERT INTO crm_contacts(dataset,email,status,contact_id,verified_at,source)
+                           VALUES (?,?,?,?,?,'hubspot')
+                           ON CONFLICT(dataset,email) DO UPDATE SET status=excluded.status,
+                           contact_id=excluded.contact_id,verified_at=excluded.verified_at,source=excluded.source""",
+                        (dataset, normalized_email, "FOUND" if contact else "NOT_FOUND",
+                         str(contact.get("id")) if isinstance(contact, dict) and contact.get("id") else None, now()),
+                    )
+            try:
+                found = crm.find_order(order.id)
+                if found is None:
+                    connection.execute(
+                        """DELETE FROM crm_orders WHERE dataset=? AND order_id=?""", (dataset, order.id)
+                    )
+                else:
+                    connection.execute(
+                        """INSERT INTO crm_orders(dataset,order_id,email,name,total,currency,status,order_status,
+                           error_message,updated_at,source,environment,last_checked_at)
+                           VALUES (?,?,?,?,?,?, 'SYNCED',?,NULL,?,'hubspot','live',?)
+                           ON CONFLICT(dataset,order_id) DO UPDATE SET email=excluded.email,name=excluded.name,
+                           total=excluded.total,currency=excluded.currency,order_status=excluded.order_status,
+                           status='SYNCED',error_message=NULL,updated_at=excluded.updated_at,source='hubspot',
+                           environment='live',last_checked_at=excluded.last_checked_at""",
+                        (dataset, order.id, found.email, found.name, found.total, found.currency,
+                         found.order_status, found.updated_at or checked, checked),
+                    )
+                current = connection.execute("SELECT * FROM orders WHERE dataset=? AND id=?", (dataset, order.id)).fetchone()
+                current_crm = connection.execute("SELECT * FROM crm_orders WHERE dataset=? AND order_id=?", (dataset, order.id)).fetchone()
+                record_event(connection, dataset, order.id, "reconciliation", "completed",
+                             f"Compared live WooCommerce and HubSpot values; result: {order_state(current, current_crm)}",
+                             before_values=compared_values(current, current_crm))
+            except (ConnectorError, ValueError) as exc:
+                message = f"{exc.source}: {exc}" if isinstance(exc, ConnectorError) else f"HubSpot: {exc}"
+                connection.execute(
+                    """INSERT INTO crm_orders(dataset,order_id,email,name,total,currency,status,order_status,
+                       error_message,updated_at,source,environment,last_checked_at)
+                       VALUES (?,?,?,?,?,?, 'ERROR',NULL,?,?, 'hubspot','live',?)
+                       ON CONFLICT(dataset,order_id) DO UPDATE SET status='ERROR',error_message=excluded.error_message,
+                       source='hubspot',environment='live',last_checked_at=excluded.last_checked_at""",
+                    (dataset, order.id, order.customer_email, order.customer_name, order.total, order.currency,
+                     message, checked, checked),
+                )
+                record_event(connection, dataset, order.id, "reconciliation", "failed",
+                             "Live CRM lookup failed.", error_message=message)
+        connection.execute(
+            "UPDATE sync_runs SET completed_at=?,processed=?,skipped=?,status='completed' WHERE id=?",
+            (now(), processed, skipped, run_id),
+        )
+    return SyncResult(run_id=run_id, processed=processed, created=0, updated=0, skipped=skipped,
+                      message="Live reconciliation completed; values were retrieved from WooCommerce and HubSpot")
+
+
+def snapshot(dataset: str = "default") -> dict[str, Any]:
+    with db() as connection:
+        orders = []
+        for row in connection.execute("SELECT * FROM orders WHERE dataset=? ORDER BY id", (dataset,)).fetchall():
+            item = dict(row)
+            crm = connection.execute(
+                "SELECT * FROM crm_orders WHERE dataset=? AND order_id=?", (dataset, row["id"])
+            ).fetchone()
+            item["state"] = order_state(row, crm)
+            item["crm"] = dict(crm) if crm else None
+            item["id"] = int(item["id"]) if item["id"].isdigit() else item["id"]
+            orders.append(item)
+        customers = [dict(row) for row in connection.execute("SELECT * FROM customers WHERE dataset=? ORDER BY name", (dataset,))]
+        contacts = {
+            row["email"]: dict(row)
+            for row in connection.execute("SELECT * FROM crm_contacts WHERE dataset=?", (dataset,)).fetchall()
+        }
+        activities = {
+            row["email"]: row["last_activity"]
+            for row in connection.execute(
+                """SELECT lower(trim(o.customer_email)) AS email,
+                          MAX(COALESCE(e.created_at, c.updated_at, o.modified_at, o.created_at)) AS last_activity
+                   FROM orders o
+                   LEFT JOIN crm_orders c ON c.dataset=o.dataset AND c.order_id=o.id
+                   LEFT JOIN order_events e ON e.dataset=o.dataset AND e.order_id=o.id
+                   WHERE o.dataset=? AND o.status IN ('processing','completed')
+                   GROUP BY lower(trim(o.customer_email))""",
+                (dataset,),
+            ).fetchall()
+        }
+        last = connection.execute("SELECT * FROM sync_runs WHERE dataset=? ORDER BY id DESC LIMIT 1", (dataset,)).fetchone()
+    groups: dict[str, dict[str, Any]] = {}
+    for order in (o for o in orders if o["state"] != "NOT_ELIGIBLE"):
+        key = normalize_email(order["customer_email"])
+        group = groups.setdefault(key, {
+            "email": key, "name": order["customer_name"], "order_count": 0, "lifetime_value": 0,
+            "synced_count": 0, "attention_count": 0, "attention_details": [],
+        })
+        group["order_count"] += 1
+        group["lifetime_value"] += order["total"]
+        if order["state"] == "SYNCED":
+            group["synced_count"] += 1
+        else:
+            group["attention_count"] += 1
+            group["attention_details"].append(f"Order #{order['id']}: {order['state']}")
+    for key, group in groups.items():
+        contact = contacts.get(key)
+        group["crm_contact_status"] = contact["status"] if contact else "UNKNOWN"
+        group["crm_contact_id"] = contact["contact_id"] if contact else None
+        group["crm_contact_verified_at"] = contact["verified_at"] if contact else None
+        group["last_activity"] = activities.get(key)
+        group["sync_state"] = "NEEDS_ATTENTION" if group["attention_count"] else "SYNCED"
+    contact_counts = {
+        "FOUND": sum(group["crm_contact_status"] == "FOUND" for group in groups.values()),
+        "NOT_FOUND": sum(group["crm_contact_status"] == "NOT_FOUND" for group in groups.values()),
+        "UNKNOWN": sum(group["crm_contact_status"] == "UNKNOWN" for group in groups.values()),
+    }
+    counts = {state: sum(o["state"] == state for o in orders) for state in STATES}
+    return {"orders": orders, "customers": customers, "eligible_order_count": sum(o["state"] != "NOT_ELIGIBLE" for o in orders),
+            "eligible_customer_count": len(groups), "groups": list(groups.values()), "contact_counts": contact_counts,
+            "customer_attention_count": sum(group["attention_count"] > 0 for group in groups.values()),
+            "counts": counts,
+            "last_run": dict(last) if last else None}
+
+
+def parse_import(body: bytes, content_type: str, format_name: str | None) -> list[dict[str, Any]]:
+    try:
+        if (format_name or "").lower() == "csv" or "text/csv" in content_type:
+            reader = csv.DictReader(io.StringIO(body.decode("utf-8-sig"), newline=""), strict=True)
+            if reader.fieldnames is None:
+                raise ValueError("CSV must include a header row")
+            if None in reader.fieldnames:
+                raise ValueError("CSV contains an empty header")
+            records = list(reader)
+            if any(None in record for record in records):
+                raise ValueError("CSV contains a row with more fields than its header")
+            return records
+        payload = json.loads(body)
+        records = payload.get("records") if isinstance(payload, dict) else payload
+        if not isinstance(records, list):
+            raise ValueError("JSON must be an array of records or an object with a records array")
+        return records
+    except (UnicodeDecodeError, csv.Error, json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(422, f"Invalid import document: {exc}") from exc
+
+
+def validate_records(records: list[dict[str, Any]], source: str) -> list[dict[str, Any]]:
+    required = {"id", "customer_email", "customer_name", "total", "currency", "status", "created_at"} if source == "woo" else {
+        "order_id", "email", "name", "total", "currency", "status", "order_status"
+    }
+    validated = []
+    for index, record in enumerate(records, 1):
+        if not isinstance(record, dict):
+            raise HTTPException(422, f"Record {index} must be an object")
+        missing = sorted(required - record.keys())
+        if missing:
+            raise HTTPException(422, f"Record {index} is missing required fields: {', '.join(missing)}")
+        identifier = record["id"] if source == "woo" else record["order_id"]
+        if not isinstance(identifier, (str, int)) or not str(identifier).strip():
+            raise HTTPException(422, f"Record {index} has an invalid identifier")
+        try:
+            total = float(record["total"])
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(422, f"Record {index} total must be numeric") from exc
+        if not math.isfinite(total) or total < 0 or len(str(record["currency"]).strip()) != 3:
+            raise HTTPException(422, f"Record {index} has invalid currency or amount")
+        status = str(record["status"]).strip()
+        if status not in (ORDER_STATUSES if source == "woo" else CRM_STATUSES):
+            raise HTTPException(422, f"Record {index} has unsupported {source} status: {status}")
+        if source == "woo":
+            validated.append({**record, "id": str(identifier).strip(), "total": total, "currency": str(record["currency"]).upper(), "status": status})
+        else:
+            order_status = str(record["order_status"]).strip()
+            if order_status not in ORDER_STATUSES:
+                raise HTTPException(422, f"Record {index} has unsupported CRM order status: {order_status}")
+            validated.append({**record, "order_id": str(identifier).strip(), "total": total, "currency": str(record["currency"]).upper(), "status": status})
+    return validated
+
+
+def import_records(records: list[dict[str, Any]], source: str, dataset: str) -> dict[str, Any]:
+    table = "orders" if source == "woo" else "crm_orders"
+    identifier_column = "id" if source == "woo" else "order_id"
+    inserted = 0
+    skipped = 0
+    with db() as connection:
+        accepted: dict[str, dict[str, Any]] = {}
+        for record in records:
+            identifier = str(record["id"] if source == "woo" else record["order_id"])
+            normalized = (
+                {"id": identifier, "customer_email": record["customer_email"], "customer_name": record["customer_name"],
+                 "total": record["total"], "currency": record["currency"], "status": record["status"], "created_at": record["created_at"]}
+                if source == "woo" else
+                {"order_id": identifier, "email": normalize_email(record["email"]), "name": record["name"],
+                 "total": record["total"], "currency": record["currency"], "status": record["status"],
+                 "order_status": record["order_status"]}
+            )
+            prior = accepted.get(identifier)
+            if prior is not None:
+                if prior != normalized:
+                    raise HTTPException(409, f"Conflicting {source} records for identifier {identifier}")
+                skipped += 1
+                continue
+            accepted[identifier] = normalized
+            existing = connection.execute(
+                f"SELECT * FROM {table} WHERE dataset=? AND {identifier_column}=?",
+                (dataset, identifier),
+            ).fetchone()
+            if existing:
+                if any(existing[key] != value for key, value in normalized.items()):
+                    raise HTTPException(409, f"Conflicting {source} record for identifier {identifier}")
+                skipped += 1
+                continue
+            if source == "woo":
+                connection.execute(
+                    """INSERT INTO orders(id,dataset,customer_email,customer_name,total,currency,status,created_at)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    (record["id"], dataset, record["customer_email"], record["customer_name"], record["total"],
+                     record["currency"], record["status"], record["created_at"]),
+                )
+            else:
+                connection.execute(
+                    """INSERT INTO crm_orders(dataset,order_id,email,name,total,currency,status,order_status,error_message,updated_at)
+                       VALUES (?,?,?,?,?,?,?,? ,NULL,?)""",
+                    (dataset, record["order_id"], normalize_email(record["email"]), record["name"], record["total"],
+                     record["currency"], record["status"], record["order_status"], now()),
+                )
+            inserted += 1
+    return {
+        "imported": inserted,
+        "inserted": inserted,
+        "skipped": skipped,
+        "rejected": 0,
+        "source": source,
+        "dataset": dataset,
+        "message": f"Imported {inserted} {source} record(s); skipped {skipped} existing record(s)",
+    }
 
 
 init_db()
@@ -184,43 +753,395 @@ def health() -> dict[str, str]:
     return {"status": "ok", "service": "woocrm-sync"}
 
 
+@app.get("/api/woocrm/config")
+def config() -> dict[str, Any]:
+    return connector_status()
+
+
+@app.get("/api/woocrm/datasets")
+def datasets() -> dict[str, Any]:
+    with db() as connection:
+        names = {
+            row["dataset"]
+            for table in ("orders", "crm_orders", "customers", "sync_runs")
+            for row in connection.execute(f"SELECT DISTINCT dataset FROM {table}")
+        }
+        result = []
+        for dataset in sorted(names):
+            order_count = connection.execute("SELECT COUNT(*) FROM orders WHERE dataset=?", (dataset,)).fetchone()[0]
+            crm_count = connection.execute("SELECT COUNT(*) FROM crm_orders WHERE dataset=?", (dataset,)).fetchone()[0]
+            customer_count = connection.execute("SELECT COUNT(*) FROM customers WHERE dataset=?", (dataset,)).fetchone()[0]
+            last_run = connection.execute(
+                "SELECT completed_at, status FROM sync_runs WHERE dataset=? ORDER BY id DESC LIMIT 1", (dataset,)
+            ).fetchone()
+            source = connection.execute(
+                "SELECT source, environment FROM orders WHERE dataset=? GROUP BY source, environment ORDER BY COUNT(*) DESC LIMIT 1",
+                (dataset,),
+            ).fetchone()
+            result.append({
+                "name": dataset,
+                "order_count": order_count,
+                "crm_record_count": crm_count,
+                "customer_count": customer_count,
+                "source": source["source"] if source else "unknown",
+                "environment": source["environment"] if source else "unknown",
+                "last_run": dict(last_run) if last_run else None,
+                "resettable": dataset == "default",
+            })
+    return {"datasets": result}
+
+
+@app.get("/api/woocrm/risk-guard")
+@app.get("/api/woocrm/risk-guard/evaluations")
+def risk_guard(dataset: str = Query("default"), status: str | None = Query(None), rule: str | None = Query(None)) -> dict[str, Any]:
+    with db() as connection:
+        query = "SELECT * FROM risk_evaluations WHERE dataset=?"
+        parameters: list[Any] = [dataset]
+        if status:
+            query += " AND risk_status=?"
+            parameters.append(status)
+        query += " ORDER BY id DESC"
+        rows = [evaluation_payload(row) for row in connection.execute(query, parameters).fetchall()]
+        settings = risk_settings(connection).__dict__
+    if rule:
+        rows = [row for row in rows if rule in row["rule_ids"]]
+    return {"evaluations": rows, "count": len(rows), "settings": settings}
+
+
+@app.get("/api/woocrm/risk-guard/settings")
+def get_risk_settings() -> dict[str, Any]:
+    with db() as connection:
+        return risk_settings(connection).__dict__
+
+
+@app.post("/api/woocrm/risk-guard/batch")
+def evaluate_risk_batch(payload: RiskBatchPayload, dataset: str = Query("default")) -> dict[str, Any]:
+    requested = list(dict.fromkeys(str(order_id) for order_id in payload.order_ids))
+    with db() as connection:
+        affected = []
+        for order_id in requested:
+            order = find_order(connection, dataset, order_id)
+            if not order or not eligible(order):
+                continue
+            crm = connection.execute("SELECT * FROM crm_orders WHERE dataset=? AND order_id=?", (dataset, order_id)).fetchone()
+            if order_state(order, crm) != "SYNCED":
+                affected.append(order_id)
+        result = evaluate_batch(len(affected), risk_settings(connection))
+        if result["risk_status"] != "CLEAR":
+            result["order_ids"] = affected
+            result["evaluated_at"] = now()
+    return result
+
+
+@app.put("/api/woocrm/risk-guard/settings")
+def update_risk_settings(payload: RiskSettingsPayload, x_actor: str | None = Header(None)) -> dict[str, Any]:
+    if not x_actor or not x_actor.strip():
+        raise HTTPException(401, "An authenticated actor is required to change risk settings")
+    if not math.isfinite(payload.absolute_total_change) or payload.absolute_total_change < 0:
+        raise HTTPException(422, "absolute_total_change must be finite and non-negative")
+    if not math.isfinite(payload.percentage_total_change) or payload.percentage_total_change < 0:
+        raise HTTPException(422, "percentage_total_change must be finite and non-negative")
+    if payload.batch_change_limit < 1 or payload.newer_crm_policy not in {"review", "block"} or payload.missing_timestamp_policy not in {"review", "allow"}:
+        raise HTTPException(422, "Risk settings contain unsupported values")
+    with db() as connection:
+        connection.executemany(
+            "INSERT OR REPLACE INTO risk_settings(key,value) VALUES (?,?)",
+            [(key, str(value)) for key, value in payload.model_dump().items()],
+        )
+    return {**payload.model_dump(), "actor": x_actor.strip()}
+
+
+@app.post("/api/woocrm/risk-guard/evaluations/{evaluation_id}/approve")
+def approve_risk_evaluation(evaluation_id: int, payload: RiskApproval, x_actor: str | None = Header(None)) -> dict[str, Any]:
+    actor = (x_actor or payload.actor or "").strip()
+    if not actor:
+        raise HTTPException(401, "An authenticated actor is required to approve a change")
+    with db() as connection:
+        row = connection.execute("SELECT * FROM risk_evaluations WHERE id=?", (evaluation_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Risk evaluation not found")
+        if row["risk_status"] == "BLOCKED":
+            raise HTTPException(409, "Blocked evaluations cannot be approved")
+        connection.execute(
+            "UPDATE risk_evaluations SET approved=1,approval_actor=?,approval_at=?,outcome='approved' WHERE id=?",
+            (actor, now(), evaluation_id),
+        )
+        return evaluation_payload(connection.execute("SELECT * FROM risk_evaluations WHERE id=?", (evaluation_id,)).fetchone())
+
+
+@app.post("/api/woocrm/risk-guard/evaluations/{evaluation_id}/reject")
+def reject_risk_evaluation(evaluation_id: int, payload: RiskApproval, x_actor: str | None = Header(None)) -> dict[str, Any]:
+    actor = (x_actor or payload.actor or "").strip()
+    if not actor:
+        raise HTTPException(401, "An authenticated actor is required to reject a change")
+    with db() as connection:
+        if not connection.execute("SELECT 1 FROM risk_evaluations WHERE id=?", (evaluation_id,)).fetchone():
+            raise HTTPException(404, "Risk evaluation not found")
+        connection.execute("UPDATE risk_evaluations SET outcome='rejected',approval_actor=?,approval_at=? WHERE id=?", (actor, now(), evaluation_id))
+    return {"evaluation_id": evaluation_id, "outcome": "rejected", "actor": actor}
+
+
+@app.post("/api/woocrm/test-connection")
+def test_connection() -> dict[str, Any]:
+    status = connector_status()
+    if status["mode"] == "demo":
+        return {**status, "connection": "verified", "message": "Demo connectors are available locally"}
+    try:
+        WooCommerceClient().test_connection()
+        if crm_provider() != "hubspot":
+            raise ConnectorError("CRM", f"Unsupported live CRM provider: {crm_provider()}")
+        HubSpotCRMAdapter().test_connection()
+    except ConnectorError as exc:
+        raise HTTPException(502, f"{exc.source}: {exc}") from exc
+    return {**status, "configured": True, "connection": "verified", "message": "WooCommerce and HubSpot connections verified"}
+
+
 @app.get("/api/woocrm/dashboard")
-def dashboard() -> dict[str, Any]:
-    return snapshot()
+def dashboard(dataset: str = Query("default")) -> dict[str, Any]:
+    return {**snapshot(dataset), "integration": connector_status()}
+
+
+@app.get("/api/woocrm/orders/{order_id}/history")
+def order_history(order_id: str, dataset: str = Query("default")) -> dict[str, Any]:
+    with db() as connection:
+        if not find_order(connection, dataset, order_id):
+            raise HTTPException(404, "Order not found")
+        events = []
+        for row in connection.execute(
+            "SELECT * FROM order_events WHERE dataset=? AND order_id=? ORDER BY id DESC",
+            (dataset, str(order_id)),
+        ).fetchall():
+            event = dict(row)
+            event["before_values"] = json.loads(event["before_values"]) if event["before_values"] else None
+            event["after_values"] = json.loads(event["after_values"]) if event["after_values"] else None
+            events.append(event)
+    return {"order_id": order_id, "dataset": dataset, "events": events}
 
 
 @app.post("/api/woocrm/sync", response_model=SyncResult)
-def sync() -> SyncResult:
-    return run_sync()
+def sync(dataset: str = Query("default")) -> SyncResult:
+    return run_sync(dataset)
 
 
 @app.post("/api/woocrm/reconcile", response_model=SyncResult)
-def reconcile() -> SyncResult:
-    return run_sync()
+def reconcile(dataset: str = Query("default")) -> SyncResult:
+    return run_sync(dataset)
 
 
 @app.post("/api/woocrm/reset")
 def reset() -> dict[str, str]:
     with db() as connection:
-        connection.execute("DELETE FROM orders")
-        connection.execute("DELETE FROM customers")
-        connection.execute("DELETE FROM sync_runs")
-        connection.executemany(
-            "INSERT INTO orders VALUES (:id,:customer_email,:customer_name,:total,:currency,:status,:created_at)",
-            seed_orders(),
-        )
-        connection.executemany(
-            "INSERT INTO customers(email,name,order_count,lifetime_value) VALUES (?,?,?,?)",
-            [("maya@example.com", "Maya Chen", 2, 196), ("liam@example.com", "Liam Carter", 1, 82.5), ("legacy@example.com", "Legacy Contact", 0, 0)],
-        )
+        reset_data(connection)
     return {"message": "Demo data reset"}
 
 
-@app.post("/api/woocrm/orders/{order_id}/mismatch")
-def create_mismatch(order_id: int) -> dict[str, str]:
+@app.post("/api/woocrm/failure")
+def failure() -> dict[str, str]:
     with db() as connection:
-        order = connection.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+        row = connection.execute("SELECT * FROM crm_orders WHERE dataset='default' ORDER BY order_id DESC LIMIT 1").fetchone()
+        if not row:
+            raise HTTPException(409, "No CRM records available")
+        connection.execute("UPDATE crm_orders SET status='ERROR',error_message='Mock CRM failure' WHERE dataset=? AND order_id=?", (row["dataset"], row["order_id"]))
+    return {"message": "Mock CRM failure enabled"}
+
+
+@app.post("/api/woocrm/import/{source}")
+async def import_source(source: str, request: Request, dataset: str = Query("default"), format_name: str | None = Query(None, alias="format")) -> dict[str, Any]:
+    if source not in {"orders", "crm-orders"}:
+        raise HTTPException(404, "Import source must be orders or crm-orders")
+    records = validate_records(parse_import(await request.body(), request.headers.get("content-type", ""), format_name), "woo" if source == "orders" else "crm")
+    return import_records(records, "woo" if source == "orders" else "crm", dataset)
+
+
+def find_order(connection: sqlite3.Connection, dataset: str, order_id: str) -> sqlite3.Row | None:
+    return connection.execute("SELECT * FROM orders WHERE dataset=? AND id=?", (dataset, str(order_id))).fetchone()
+
+
+def live_write_action(order_id: str, dataset: str, event_type: str, approval_id: int | None = None) -> dict[str, Any]:
+    action_label = "Replay" if event_type == "replay" else "Mismatch correction"
+    with db() as connection:
+        order = find_order(connection, dataset, order_id)
         if not order:
-            raise HTTPException(status_code=404, detail="Order not found")
-        connection.execute("UPDATE customers SET lifetime_value=lifetime_value+1 WHERE email=?", (order["customer_email"],))
+            raise HTTPException(404, "Order not found")
+        crm = connection.execute(
+            "SELECT * FROM crm_orders WHERE dataset=? AND order_id=?", (dataset, order["id"])
+        ).fetchone()
+        state = order_state(order, crm)
+        allowed = {"MISSING", "ERROR"} if event_type == "replay" else {"MISMATCH"}
+        if state not in allowed:
+            reason = f"{action_label} is only allowed for {', '.join(sorted(allowed))}; current state is {state}"
+            record_event(connection, dataset, order_id, event_type, "blocked", f"{action_label} was not run.", error_message=reason)
+            raise HTTPException(409, reason)
+        if order["environment"] != "live" or order["source"] != "woocommerce":
+            reason = "Live CRM writes are restricted to orders fetched from WooCommerce in live mode"
+            record_event(connection, dataset, order_id, event_type, "blocked", f"{action_label} was not run.", error_message=reason)
+            raise HTTPException(409, reason)
+
+        status = connector_status()
+        if not status["configured"] or not status.get("field_mapping_configured", False):
+            reason = "Live CRM writes are blocked until connector configuration and field mapping are verified"
+            record_event(connection, dataset, order_id, event_type, "blocked", f"{action_label} was not run.", error_message=reason)
+            raise HTTPException(409, reason)
+        if not writes_enabled():
+            reason = "Live CRM writes are disabled; set CRM_WRITE_ENABLED=true only after verification"
+            record_event(connection, dataset, order_id, event_type, "blocked", f"{action_label} was not run.", error_message=reason)
+            raise HTTPException(409, reason)
+
+        before = compared_values(order, crm)
+        try:
+            woo = WooCommerceClient()
+            crm_adapter = HubSpotCRMAdapter()
+            woo.test_connection()
+            crm_adapter.test_connection()
+            external = crm_adapter.find_order(str(order["id"]))
+            if event_type == "mismatch_correction" and external is None:
+                raise ConnectorError("HubSpot", "Mismatch correction requires the existing CRM record to be found")
+            normalized = NormalizedOrder(
+                id=str(order["id"]),
+                customer_email=normalize_email(order["customer_email"]),
+                customer_name=order["customer_name"],
+                total=float(order["total"]),
+                currency=order["currency"],
+                status=order["status"],
+                created_at=order["created_at"],
+            )
+            enforce_risk_guard(connection, order, external, approval_id)
+            try:
+                verified = crm_adapter.write_order(normalized, external)
+            except RiskBlocked as exc:
+                raise HTTPException(409, {"message": str(exc), "evaluation_id": exc.evaluation_id, "evaluation": exc.evaluation})
+            checked = now()
+            connection.execute(
+                """INSERT INTO crm_orders(dataset,order_id,email,name,total,currency,status,order_status,
+                   error_message,updated_at,source,environment,last_checked_at)
+                   VALUES (?,?,?,?,?,?, 'SYNCED',?,NULL,?,'hubspot','live',?)
+                   ON CONFLICT(dataset,order_id) DO UPDATE SET email=excluded.email,name=excluded.name,
+                   total=excluded.total,currency=excluded.currency,status='SYNCED',order_status=excluded.order_status,
+                   error_message=NULL,updated_at=excluded.updated_at,source='hubspot',environment='live',
+                   last_checked_at=excluded.last_checked_at""",
+                (dataset, order["id"], verified.email, verified.name, verified.total, verified.currency,
+                 verified.order_status, verified.updated_at or checked, checked),
+            )
+            after = connection.execute(
+                "SELECT * FROM crm_orders WHERE dataset=? AND order_id=?", (dataset, order["id"])
+            ).fetchone()
+            verified_state = order_state(order, after)
+            if verified_state != "SYNCED":
+                raise ConnectorError("HubSpot", f"{action_label} completed but verification returned {verified_state}")
+            record_event(
+                connection, dataset, order_id, event_type, "verified",
+                f"{action_label} completed and a fresh CRM lookup verified consistency.",
+                before_values=before, after_values=compared_values(order, after),
+            )
+            return {"state": "SYNCED", "message": f"{action_label} completed for order {order_id} and verified"}
+        except RiskBlocked as exc:
+            raise HTTPException(409, {"message": str(exc), "evaluation_id": exc.evaluation_id, "evaluation": exc.evaluation})
+        except (ConnectorError, ValueError) as exc:
+            message = f"{exc.source}: {exc}" if isinstance(exc, ConnectorError) else str(exc)
+            checked = now()
+            connection.execute(
+                """INSERT INTO crm_orders(dataset,order_id,email,name,total,currency,status,order_status,
+                   error_message,updated_at,source,environment,last_checked_at)
+                   VALUES (?,?,?,?,?,?, 'ERROR',NULL,?,?, 'hubspot','live',?)
+                   ON CONFLICT(dataset,order_id) DO UPDATE SET status='ERROR',error_message=excluded.error_message,
+                   source='hubspot',environment='live',last_checked_at=excluded.last_checked_at""",
+                (dataset, order["id"], normalize_email(order["customer_email"]), order["customer_name"],
+                 order["total"], order["currency"], message, checked, checked),
+            )
+            record_event(connection, dataset, order_id, event_type, "failed", f"{action_label} was not verified.", error_message=message)
+            raise HTTPException(502, f"{action_label} failed: {message}") from exc
+
+
+@app.post("/api/woocrm/orders/{order_id}/replay")
+def replay(order_id: str, dataset: str = Query("default"), approval_id: int | None = Query(None)) -> dict[str, Any]:
+    if integration_mode() == "live":
+        return live_write_action(order_id, dataset, "replay", approval_id)
+    blocked_reason: str | None = None
+    failure: HTTPException | None = None
+    with db() as connection:
+        order = find_order(connection, dataset, order_id)
+        if not order:
+            raise HTTPException(404, "Order not found")
+        crm = connection.execute("SELECT * FROM crm_orders WHERE dataset=? AND order_id=?", (dataset, order["id"])).fetchone()
+        state = order_state(order, crm)
+        if state not in {"MISSING", "ERROR"}:
+            blocked_reason = f"Replay is only allowed for MISSING or recoverable ERROR; current state is {state}"
+            record_event(connection, dataset, order_id, "replay", "blocked", "Replay was not run.", error_message=blocked_reason)
+        else:
+            try:
+                result = sync_order(connection, order) if approval_id is None else sync_order(connection, order, approval_id)
+                after = connection.execute("SELECT * FROM crm_orders WHERE dataset=? AND order_id=?", (dataset, order["id"])).fetchone()
+                verified_state = order_state(order, after)
+                if verified_state != "SYNCED":
+                    raise HTTPException(502, f"Replay write completed but fresh verification returned {verified_state}")
+                record_event(
+                    connection, dataset, order_id, "replay", "verified",
+                    "Replay completed and a fresh comparison verified consistency.",
+                    before_values=compared_values(order, crm),
+                    after_values=compared_values(order, after),
+                )
+                return {"state": result, "message": f"Order {order_id} replayed and verified"}
+            except HTTPException as exc:
+                record_event(connection, dataset, order_id, "replay", "failed", "Replay was not applied.", error_message=str(exc.detail))
+                failure = exc
+            except RiskBlocked as exc:
+                record_event(connection, dataset, order_id, "replay", "blocked", "Replay was held by the risk guard.", error_message=str(exc))
+                failure = HTTPException(409, {"message": str(exc), "evaluation_id": exc.evaluation_id, "evaluation": exc.evaluation})
+            except Exception as exc:
+                record_event(connection, dataset, order_id, "replay", "failed", "Replay was not applied.", error_message=str(exc))
+                failure = HTTPException(502, "Replay failed while communicating with the simulated CRM")
+    if failure is not None:
+        raise failure
+    if blocked_reason is not None:
+        raise HTTPException(409, blocked_reason)
+    raise HTTPException(500, "Replay did not produce a result")
+
+
+@app.post("/api/woocrm/orders/{order_id}/update")
+def update_mismatch(order_id: str, dataset: str = Query("default"), approval_id: int | None = Query(None)) -> dict[str, Any]:
+    if integration_mode() == "live":
+        return live_write_action(order_id, dataset, "mismatch_correction", approval_id)
+    try:
+        with db() as connection:
+            order = find_order(connection, dataset, order_id)
+            if not order:
+                raise HTTPException(404, "Order not found")
+            crm = connection.execute("SELECT * FROM crm_orders WHERE dataset=? AND order_id=?", (dataset, order["id"])).fetchone()
+            if order_state(order, crm) != "MISMATCH":
+                raise HTTPException(409, "Order is not mismatched")
+            before = compared_values(order, crm)
+            sync_order(connection, order, approval_id)
+            after = connection.execute("SELECT * FROM crm_orders WHERE dataset=? AND order_id=?", (dataset, order["id"])).fetchone()
+            verified_state = order_state(order, after)
+            if verified_state != "SYNCED":
+                raise HTTPException(502, f"CRM update completed but fresh verification returned {verified_state}")
+            record_event(
+                connection, dataset, order_id, "mismatch_correction", "verified",
+                "CRM values were updated from WooCommerce and a fresh comparison verified consistency.",
+                before_values=before, after_values=compared_values(order, after),
+            )
+        return {"state": "SYNCED", "message": f"CRM updated from WooCommerce for order {order_id} and verified"}
+    except HTTPException as exc:
+        with db() as connection:
+            if find_order(connection, dataset, order_id):
+                record_event(connection, dataset, order_id, "mismatch_correction", "failed", "Mismatch correction was not applied.", error_message=str(exc.detail))
+        raise
+    except RiskBlocked as exc:
+        with db() as connection:
+            record_event(connection, dataset, order_id, "mismatch_correction", "blocked", "Mismatch correction was held by the risk guard.", error_message=str(exc))
+        raise HTTPException(409, {"message": str(exc), "evaluation_id": exc.evaluation_id, "evaluation": exc.evaluation})
+
+
+@app.post("/api/woocrm/orders/{order_id}/mismatch")
+def create_mismatch(order_id: str, dataset: str = Query("default")) -> dict[str, str]:
+    if integration_mode() == "live":
+        raise HTTPException(409, "Demo mismatch injection is unavailable in live mode")
+    with db() as connection:
+        order = find_order(connection, dataset, order_id)
+        if not order:
+            raise HTTPException(404, "Order not found")
+        crm = connection.execute("SELECT * FROM crm_orders WHERE dataset=? AND order_id=?", (dataset, order["id"])).fetchone()
+        if not crm:
+            sync_order(connection, order)
+        connection.execute("UPDATE crm_orders SET total=total+1 WHERE dataset=? AND order_id=?", (dataset, order["id"]))
     return {"message": "A demo CRM mismatch was introduced"}
