@@ -210,7 +210,7 @@ def test_demo_reset_is_idempotent_without_duplicate_default_records():
 
 def test_arbitrary_order_import_reconcile_replay_and_idempotency():
     reset()
-    dataset = f"imported-{uuid4().hex}"
+    dataset = f"imp-{uuid4().hex}"
     order = {
         "id": "new-order-9001", "customer_email": "new@example.com", "customer_name": "New Customer",
         "total": 25.5, "currency": "EUR", "status": "processing", "created_at": "2026-10-30T10:00:00Z",
@@ -231,7 +231,7 @@ def test_arbitrary_order_import_reconcile_replay_and_idempotency():
 
 def test_crm_import_mismatch_and_invalid_import():
     reset()
-    dataset = f"controlled-{uuid4().hex}"
+    dataset = f"ctl-{uuid4().hex}"
     order = {
         "id": "new-order-9002", "customer_email": "new@example.com", "customer_name": "New Customer",
         "total": 40, "currency": "USD", "status": "processing", "created_at": "2026-10-30T10:00:00Z",
@@ -262,7 +262,7 @@ def test_crm_import_mismatch_and_invalid_import():
 
 def test_reset_preserves_imported_datasets():
     reset()
-    dataset = f"isolated-{uuid4().hex}"
+    dataset = f"iso-{uuid4().hex}"
     order = {
         "id": "isolated-order", "customer_email": "isolated@example.com", "customer_name": "Isolated Customer",
         "total": 12, "currency": "USD", "status": "processing", "created_at": "2026-10-30T10:00:00Z",
@@ -295,7 +295,7 @@ def test_csv_import_reports_inserted_and_skipped_records():
 
 
 def test_duplicate_rows_in_one_import_are_counted_once_and_conflicts_are_rejected():
-    dataset = f"duplicates-{uuid4().hex}"
+    dataset = f"dup-{uuid4().hex}"
     order = {
         "id": "duplicate-1", "customer_email": "duplicate@example.com", "customer_name": "Duplicate",
         "total": 5, "currency": "USD", "status": "processing", "created_at": "2026-10-30T10:00:00Z",
@@ -560,7 +560,7 @@ def test_live_replay_writes_then_reconciles_with_mocked_connectors(monkeypatch):
 
 
 def test_reconciliation_does_not_repair_missing_records():
-    dataset = f"reconcile-{uuid4().hex}"
+    dataset = f"rec-{uuid4().hex}"
     order = {
         "id": "missing-1", "customer_email": "missing@example.com", "customer_name": "Missing",
         "total": 10, "currency": "USD", "status": "processing", "created_at": "2026-10-30T10:00:00Z",

@@ -3,10 +3,13 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import math
 import os
+import re
 import secrets
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,6 +41,16 @@ CRM_STATUSES = {"SYNCED", "ERROR"}
 STATES = {"SYNCED", "MISSING", "MISMATCH", "ERROR", "NOT_ELIGIBLE"}
 
 app = FastAPI(title="WooCRM Sync", version="0.3.0")
+logger = logging.getLogger(__name__)
+DATASET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+MAX_IMPORT_BYTES_DEFAULT = 10 * 1024 * 1024
+MAX_IMPORT_RECORDS_DEFAULT = 5000
+FIELD_MAX_LENGTHS = {
+    "id": 100, "order_id": 100, "customer_email": 320, "email": 320,
+    "customer_name": 200, "name": 200, "currency": 3, "status": 32,
+    "order_status": 32, "created_at": 64, "modified_at": 64, "updated_at": 64,
+}
 
 
 def _is_true(value: str | None, *, default: bool = False) -> bool:
@@ -54,6 +67,41 @@ def operator_name() -> str:
 
 def configured_api_key() -> str:
     return os.getenv("API_ACCESS_KEY", "").strip()
+
+
+def import_limit(name: str, default: int) -> int:
+    value = os.getenv(name, str(default)).strip()
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if limit < 1:
+        raise RuntimeError(f"{name} must be positive")
+    return limit
+
+
+def validate_dataset_name(dataset: str) -> str:
+    if not DATASET_PATTERN.fullmatch(dataset):
+        raise HTTPException(422, "Dataset name must match ^[a-z0-9][a-z0-9_-]{0,39}$")
+    return dataset
+
+
+def _redact_secrets(message: str) -> str:
+    redacted = message
+    for secret in (configured_api_key(), os.getenv("HUBSPOT_ACCESS_TOKEN", "").strip(),
+                   os.getenv("WOOCOMMERCE_CONSUMER_KEY", "").strip(),
+                   os.getenv("WOOCOMMERCE_CONSUMER_SECRET", "").strip()):
+        if secret:
+            redacted = redacted.replace(secret, "[REDACTED]")
+    return redacted
+
+
+def connector_failure(exc: ConnectorError, operation: str) -> HTTPException:
+    correlation_id = uuid.uuid4().hex[:12]
+    detail = _redact_secrets(str(exc))
+    logger.error("Connector failure operation=%s source=%s correlation_id=%s detail=%s",
+                 operation, exc.source, correlation_id, detail)
+    return HTTPException(502, f"{exc.source} request failed; reference {correlation_id}")
 
 
 def validate_startup_config() -> None:
@@ -529,7 +577,7 @@ def run_live_sync(dataset: str) -> SyncResult:
                 (dataset, started, now()),
             ).lastrowid
             record_event(connection, dataset, "*", "reconciliation", "failed", "Live reconciliation could not start.", error_message=f"{exc.source}: {exc}")
-        raise HTTPException(502, f"{exc.source}: {exc}") from exc
+        raise connector_failure(exc, "live reconciliation startup") from exc
 
     processed = skipped = 0
     with db() as connection:
@@ -592,7 +640,9 @@ def run_live_sync(dataset: str) -> SyncResult:
                              f"Compared live WooCommerce and HubSpot values; result: {order_state(current, current_crm)}",
                              before_values=compared_values(current, current_crm))
             except (ConnectorError, ValueError) as exc:
-                message = f"{exc.source}: {exc}" if isinstance(exc, ConnectorError) else f"HubSpot: {exc}"
+                message = _redact_secrets(
+                    f"{exc.source}: {exc}" if isinstance(exc, ConnectorError) else f"HubSpot: {exc}"
+                )
                 connection.execute(
                     """INSERT INTO crm_orders(dataset,order_id,email,name,total,currency,status,order_status,
                        error_message,updated_at,source,environment,last_checked_at)
@@ -709,9 +759,16 @@ def validate_records(records: list[dict[str, Any]], source: str) -> list[dict[st
         missing = sorted(required - record.keys())
         if missing:
             raise HTTPException(422, f"Record {index} is missing required fields: {', '.join(missing)}")
+        for field, value in record.items():
+            maximum = FIELD_MAX_LENGTHS.get(field)
+            if maximum is not None and (not isinstance(value, str) or len(value) > maximum):
+                raise HTTPException(422, f"Record {index} field '{field}' exceeds the maximum length of {maximum}")
         identifier = record["id"] if source == "woo" else record["order_id"]
         if not isinstance(identifier, (str, int)) or not str(identifier).strip():
             raise HTTPException(422, f"Record {index} has an invalid identifier")
+        email_field = "customer_email" if source == "woo" else "email"
+        if not isinstance(record[email_field], str) or not EMAIL_PATTERN.fullmatch(record[email_field].strip()):
+            raise HTTPException(422, f"Record {index} field '{email_field}' is not a valid email address")
         try:
             total = float(record["total"])
         except (TypeError, ValueError) as exc:
@@ -721,6 +778,16 @@ def validate_records(records: list[dict[str, Any]], source: str) -> list[dict[st
         status = str(record["status"]).strip()
         if status not in (ORDER_STATUSES if source == "woo" else CRM_STATUSES):
             raise HTTPException(422, f"Record {index} has unsupported {source} status: {status}")
+        timestamp_fields = ("created_at", "modified_at") if source == "woo" else ("updated_at",)
+        for field in timestamp_fields:
+            value = record.get(field)
+            if value is not None:
+                if not isinstance(value, str):
+                    raise HTTPException(422, f"Record {index} field '{field}' must be an ISO timestamp")
+                try:
+                    datetime.fromisoformat(value.replace("Z", "+00:00"))
+                except ValueError as exc:
+                    raise HTTPException(422, f"Record {index} field '{field}' must be an ISO timestamp") from exc
         if source == "woo":
             validated.append({**record, "id": str(identifier).strip(), "total": total, "currency": str(record["currency"]).upper(), "status": status})
         else:
@@ -931,7 +998,7 @@ def test_connection() -> dict[str, Any]:
             raise ConnectorError("CRM", f"Unsupported live CRM provider: {crm_provider()}")
         HubSpotCRMAdapter().test_connection()
     except ConnectorError as exc:
-        raise HTTPException(502, f"{exc.source}: {exc}") from exc
+        raise connector_failure(exc, "connection test") from exc
     return {**status, "configured": True, "connection": "verified", "message": "WooCommerce and HubSpot connections verified"}
 
 
@@ -990,7 +1057,27 @@ def failure() -> dict[str, str]:
 async def import_source(source: str, request: Request, dataset: str = Query("default"), format_name: str | None = Query(None, alias="format")) -> dict[str, Any]:
     if source not in {"orders", "crm-orders"}:
         raise HTTPException(404, "Import source must be orders or crm-orders")
-    records = validate_records(parse_import(await request.body(), request.headers.get("content-type", ""), format_name), "woo" if source == "orders" else "crm")
+    dataset = validate_dataset_name(dataset)
+    max_bytes = import_limit("MAX_IMPORT_BYTES", MAX_IMPORT_BYTES_DEFAULT)
+    max_records = import_limit("MAX_IMPORT_RECORDS", MAX_IMPORT_RECORDS_DEFAULT)
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > max_bytes:
+                raise HTTPException(413, f"Import exceeds the {max_bytes}-byte limit")
+        except ValueError as exc:
+            raise HTTPException(422, "Content-Length must be a valid integer") from exc
+    chunks: list[bytes] = []
+    received = 0
+    async for chunk in request.stream():
+        received += len(chunk)
+        if received > max_bytes:
+            raise HTTPException(413, f"Import exceeds the {max_bytes}-byte limit")
+        chunks.append(chunk)
+    records = parse_import(b"".join(chunks), request.headers.get("content-type", ""), format_name)
+    if len(records) > max_records:
+        raise HTTPException(413, f"Import contains more than the {max_records}-record limit")
+    records = validate_records(records, "woo" if source == "orders" else "crm")
     return import_records(records, "woo" if source == "orders" else "crm", dataset)
 
 
@@ -1078,7 +1165,7 @@ def live_write_action(order_id: str, dataset: str, event_type: str, approval_id:
         except RiskBlocked as exc:
             raise HTTPException(409, {"message": str(exc), "evaluation_id": exc.evaluation_id, "evaluation": exc.evaluation})
         except (ConnectorError, ValueError) as exc:
-            message = f"{exc.source}: {exc}" if isinstance(exc, ConnectorError) else str(exc)
+            message = _redact_secrets(f"{exc.source}: {exc}" if isinstance(exc, ConnectorError) else str(exc))
             checked = now()
             connection.execute(
                 """INSERT INTO crm_orders(dataset,order_id,email,name,total,currency,status,order_status,
@@ -1090,6 +1177,8 @@ def live_write_action(order_id: str, dataset: str, event_type: str, approval_id:
                  order["total"], order["currency"], message, checked, checked),
             )
             record_event(connection, dataset, order_id, event_type, "failed", f"{action_label} was not verified.", error_message=message)
+            if isinstance(exc, ConnectorError):
+                raise connector_failure(exc, f"live {event_type}") from exc
             raise HTTPException(502, f"{action_label} failed: {message}") from exc
 
 
