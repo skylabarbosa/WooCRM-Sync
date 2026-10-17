@@ -8,6 +8,29 @@ Hackathon MVP that reconciles WooCommerce orders with a CRM. Demo mode uses dete
 - Node.js 20+
 - npm
 
+## Production
+
+Production startup requires `APP_ENV=production` and a non-empty `API_ACCESS_KEY`.
+The shared key is sent in `X-API-Key`; `/api/woocrm/health` and
+`/api/woocrm/ready` remain public. In demo mode, authentication is disabled by
+default, but setting `API_ACCESS_KEY` protects mutating endpoints. CORS is
+controlled by the comma-separated `CORS_ORIGINS` variable. `DEMO_RESET_ENABLED`
+defaults to true in demo mode and false in production. The server sets the
+operator identity from `OPERATOR_NAME`; client actor headers are ignored.
+
+The shared API key is basic access control only: it is one secret, readable by
+JavaScript on the same origin, and provides no per-user identity or roles. It
+is not a replacement for real accounts. Keep `CRM_WRITE_ENABLED=false` unless
+live writes have been independently verified; enabling it can create or update
+CRM records.
+
+SQLite is single-instance storage. Run one backend instance against a persistent
+disk, and back up `backend/woocrm.db` before upgrades or operational changes.
+The import limits are 10 MB per document and 5,000 records by default; set
+`MAX_IMPORT_BYTES` and `MAX_IMPORT_RECORDS` explicitly when a different limit
+is required. Place frontend variables in `frontend/.env.local`, copied from
+`frontend/.env.example`; never put the API key in a `VITE_*` variable.
+
 ## Run the backend
 
 ```powershell
@@ -29,11 +52,11 @@ followed by a fresh comparison before the API reports verification. The Settings
 Risk Guard evaluates every proposed CRM write immediately before it is applied. It flags
 large total changes, currency changes, unusually large requested batches, and stale or
 untrustworthy timestamp comparisons without labeling any signal as fraud. Review records
-are available from `GET /api/woocrm/risk-guard/evaluations`; approval requires an actor and
-is tied to the exact evaluated record fingerprint. A changed CRM record invalidates that
+are available from `GET /api/woocrm/risk-guard/evaluations`; approval is recorded with
+the server-set operator and is tied to the exact evaluated record fingerprint. A changed CRM record invalidates that
 approval. `POST /api/woocrm/risk-guard/batch` evaluates the actual affected order IDs,
 and `GET/PUT /api/woocrm/risk-guard/settings` reads or changes validated thresholds
-(the update requires `X-Actor`). Live CRM writes remain disabled unless
+Live CRM writes remain disabled unless
 `CRM_WRITE_ENABLED=true` is explicitly configured.
 
 ## Importing data
@@ -77,3 +100,10 @@ Live environment variables:
 - `HUBSPOT_ORDER_ID_PROPERTY`, `HUBSPOT_EMAIL_PROPERTY`, `HUBSPOT_TOTAL_PROPERTY`, `HUBSPOT_CURRENCY_PROPERTY`, `HUBSPOT_STATUS_PROPERTY`
 
 The HubSpot adapter currently supports deal search, deal creation, and deal property updates. It does not support contact creation, contact updates, deletion, bulk writes, or arbitrary CRM object types. Automated tests use mocked HTTP responses only; a real account test is still required before enabling live writes.
+
+## Known Limitations
+
+- Live WooCommerce and HubSpot behavior has not been verified against real accounts.
+- There are no database migrations.
+- Live search-then-create can race under concurrent requests.
+- The shared API key does not provide per-user identity or roles.
