@@ -184,3 +184,28 @@ def test_connector_errors_are_sanitized(isolated_app, monkeypatch):
     assert response.status_code == 502
     assert secret not in response.text
     assert "reference" in response.json()["detail"]
+
+
+def test_hubspot_token_never_appears_in_captured_logs_or_api_responses(isolated_app, monkeypatch, caplog):
+    token = "hubspot-production-token-that-must-not-leak"
+    monkeypatch.setenv("INTEGRATION_MODE", "live")
+    monkeypatch.setenv("CRM_PROVIDER", "hubspot")
+    monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", token)
+
+    class FailingHubSpot:
+        def test_connection(self):
+            raise ConnectorError("HubSpot", f"upstream echoed {token}")
+
+    class WorkingWoo:
+        def test_connection(self):
+            return None
+
+    monkeypatch.setattr(main, "WooCommerceClient", WorkingWoo)
+    monkeypatch.setattr(main, "HubSpotCRMAdapter", FailingHubSpot)
+    with caplog.at_level("ERROR", logger="app.main"):
+        response = isolated_app.post("/api/woocrm/test-connection")
+
+    assert response.status_code == 502
+    assert token not in response.text
+    assert token not in caplog.text
+    assert "[REDACTED]" in caplog.text
