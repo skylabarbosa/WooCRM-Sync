@@ -1,3 +1,4 @@
+import json
 import pytest
 import httpx
 from concurrent.futures import ThreadPoolExecutor
@@ -143,9 +144,9 @@ def test_customer_snapshot_exposes_authoritative_group_metrics_and_unknown_conta
     assert payload["eligible_customer_count"] == len(payload["groups"])
     assert payload["customer_attention_count"] == sum(group["attention_count"] > 0 for group in payload["groups"])
     assert all(group["synced_count"] <= group["order_count"] for group in payload["groups"])
-    assert payload["contact_counts"]["NOT_FOUND"] == 0
+    assert payload["contact_counts"]["NOT_FOUND"] == 2
     assert sum(group["crm_contact_status"] == "FOUND" for group in payload["groups"]) == 4
-    assert sum(group["crm_contact_status"] == "UNKNOWN" for group in payload["groups"]) == 14
+    assert sum(group["crm_contact_status"] == "NOT_CHECKED" for group in payload["groups"]) == 12
 
     with db() as connection:
         connection.execute(
@@ -170,7 +171,7 @@ def test_customer_contact_counts_only_use_persisted_verification():
         )
     payload = dashboard()
     assert payload["contact_counts"]["FOUND"] == 5
-    assert payload["contact_counts"]["NOT_FOUND"] == 1
+    assert payload["contact_counts"]["NOT_FOUND"] == 3
     assert next(group for group in payload["groups"] if group["email"] == "maya.chen@example.test")["crm_contact_status"] == "FOUND"
     assert next(group for group in payload["groups"] if group["email"] == "liam.carter@example.test")["crm_contact_status"] == "NOT_FOUND"
 
@@ -203,7 +204,7 @@ def test_demo_reset_is_idempotent_without_duplicate_default_records():
     with db() as connection:
         assert connection.execute("SELECT COUNT(*) FROM orders WHERE dataset='default'").fetchone()[0] == 20
         assert connection.execute("SELECT COUNT(*) FROM crm_orders WHERE dataset='default'").fetchone()[0] == 14
-        assert connection.execute("SELECT COUNT(*) FROM crm_contacts WHERE dataset='default'").fetchone()[0] == 4
+        assert connection.execute("SELECT COUNT(*) FROM crm_contacts WHERE dataset='default'").fetchone()[0] == 6
         assert connection.execute(
             "SELECT COUNT(*) FROM orders WHERE dataset='default' GROUP BY id HAVING COUNT(*) > 1"
         ).fetchall() == []
@@ -525,6 +526,20 @@ def test_hubspot_connection_checks_deals_without_writing(monkeypatch):
     assert requests[0].url.path == "/crm/v3/objects/deals"
 
 
+def test_hubspot_contact_lookup_normalizes_email(monkeypatch):
+    monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", "token")
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={"results": [{"id": "contact-1"}]})
+
+    adapter = HubSpotCRMAdapter(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert adapter.find_contact("  Buyer@Example.com ")["id"] == "contact-1"
+    payload = json.loads(requests[0].content)
+    assert payload["filterGroups"][0]["filters"][0]["value"] == "buyer@example.com"
+
+
 def test_live_lookup_failure_is_error_not_missing(monkeypatch):
     reset()
     monkeypatch.setenv("INTEGRATION_MODE", "live")
@@ -554,6 +569,41 @@ def test_live_lookup_failure_is_error_not_missing(monkeypatch):
     assert live_order["state"] == "ERROR"
     assert live_order["state"] != "MISSING"
     assert client.get("/api/woocrm/orders/live-1/history").json()["events"][0]["outcome"] == "failed"
+
+
+def test_live_contact_reconciliation_persists_found_not_found_and_lookup_error(monkeypatch):
+    monkeypatch.setenv("INTEGRATION_MODE", "live")
+    monkeypatch.setenv("CRM_PROVIDER", "hubspot")
+
+    class FakeWoo:
+        def list_orders(self):
+            return [
+                NormalizedOrder("live-contact-1", " Found@Example.com ", "Found", 12, "USD", "processing", "2026-10-14T10:00:00Z"),
+                NormalizedOrder("live-contact-2", "missing@example.com", "Missing", 13, "USD", "processing", "2026-10-14T10:00:00Z"),
+                NormalizedOrder("live-contact-3", "error@example.com", "Error", 14, "USD", "processing", "2026-10-14T10:00:00Z"),
+            ]
+
+    class FakeCRM:
+        def __init__(self):
+            pass
+
+        def find_contact(self, email):
+            if email == "found@example.com":
+                return {"id": "contact-1"}
+            if email == "error@example.com":
+                raise ConnectorError("HubSpot", "simulated contact lookup failure")
+            return None
+
+        def find_order(self, external_order_id):
+            return None
+
+    monkeypatch.setattr(main, "WooCommerceClient", FakeWoo)
+    monkeypatch.setattr(main, "HubSpotCRMAdapter", FakeCRM)
+    assert client.post("/api/woocrm/reconcile").status_code == 200
+    groups = {group["email"]: group for group in client.get("/api/woocrm/dashboard").json()["groups"]}
+    assert groups["found@example.com"]["crm_contact_status"] == "FOUND"
+    assert groups["missing@example.com"]["crm_contact_status"] == "NOT_FOUND"
+    assert groups["error@example.com"]["crm_contact_status"] == "LOOKUP_ERROR"
 
 
 def test_live_replay_writes_then_reconciles_with_mocked_connectors(monkeypatch):

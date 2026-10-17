@@ -71,7 +71,7 @@ def seed_crm_orders(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def seed_crm_contacts(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Contacts are independent CRM people records, not CRM order/deal records."""
-    return [
+    found = [
         {
             "email": orders[index]["customer_email"],
             "status": "FOUND",
@@ -81,3 +81,14 @@ def seed_crm_contacts(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }
         for index in (8, 9, 10, 11)
     ]
+    not_found = [
+        {
+            "email": orders[index]["customer_email"],
+            "status": "NOT_FOUND",
+            "contact_id": None,
+            "verified_at": f"2026-10-{index + 1:02d}T14:00:00Z",
+            "source": "demo",
+        }
+        for index in (12, 13)
+    ]
+    return found + not_found

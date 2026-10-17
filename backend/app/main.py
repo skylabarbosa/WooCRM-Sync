@@ -285,7 +285,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         CREATE UNIQUE INDEX IF NOT EXISTS crm_orders_dataset_order_id_unique ON crm_orders(dataset, order_id);
         CREATE TABLE IF NOT EXISTS crm_contacts (
           dataset TEXT NOT NULL DEFAULT 'default', email TEXT NOT NULL,
-          status TEXT NOT NULL CHECK(status IN ('FOUND', 'NOT_FOUND')),
+          status TEXT NOT NULL CHECK(status IN ('FOUND', 'NOT_FOUND', 'NOT_CHECKED', 'LOOKUP_ERROR')),
           contact_id TEXT, verified_at TEXT NOT NULL, source TEXT NOT NULL,
           PRIMARY KEY (dataset, email)
         );
@@ -334,6 +334,11 @@ def _create_schema(connection: sqlite3.Connection) -> None:
 
 def init_db() -> None:
     with db() as connection:
+        contact_schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='crm_contacts'"
+        ).fetchone()
+        if contact_schema and "LOOKUP_ERROR" not in (contact_schema["sql"] or ""):
+            connection.execute("ALTER TABLE crm_contacts RENAME TO legacy_crm_contacts")
         tables = {row["name"] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         migrated_tables: set[str] = set()
         for table in ("orders", "crm_orders", "customers", "sync_runs"):
@@ -343,6 +348,12 @@ def init_db() -> None:
                     connection.execute(f"ALTER TABLE {table} RENAME TO legacy_{table}")
                     migrated_tables.add(table)
         _create_schema(connection)
+        if "legacy_crm_contacts" in tables:
+            connection.execute(
+                """INSERT OR IGNORE INTO crm_contacts(dataset,email,status,contact_id,verified_at,source)
+                   SELECT dataset,email,status,contact_id,verified_at,source FROM legacy_crm_contacts"""
+            )
+            connection.execute("DROP TABLE legacy_crm_contacts")
         connection.executemany(
             "INSERT OR IGNORE INTO risk_settings(key,value) VALUES (?,?)",
             [
@@ -401,7 +412,7 @@ def reset_data(connection: sqlite3.Connection) -> None:
     connection.executemany(
         """INSERT INTO crm_contacts(dataset,email,status,contact_id,verified_at,source)
            VALUES ('default',:email,:status,:contact_id,:verified_at,:source)""",
-        seed_crm_contacts(orders),
+        [{**record, "email": normalize_email(record["email"])} for record in seed_crm_contacts(orders)],
     )
     connection.executemany(
         """INSERT INTO crm_orders(dataset,order_id,email,name,total,currency,status,order_status,error_message,updated_at)
@@ -687,8 +698,16 @@ def run_live_sync(dataset: str) -> SyncResult:
                 verified_contacts.add(normalized_email)
                 try:
                     contact = find_contact(normalized_email)
-                except ConnectorError:
-                    contact = None
+                except ConnectorError as exc:
+                    connection.execute(
+                        """INSERT INTO crm_contacts(dataset,email,status,contact_id,verified_at,source)
+                           VALUES (?,?,?,?,?,'hubspot')
+                           ON CONFLICT(dataset,email) DO UPDATE SET status=excluded.status,
+                           contact_id=NULL,verified_at=excluded.verified_at,source=excluded.source""",
+                        (dataset, normalized_email, "LOOKUP_ERROR", None, now()),
+                    )
+                    logger.warning("CRM contact lookup failed source=%s email=%s detail=%s",
+                                   exc.source, normalized_email, _redact_secrets(str(exc)))
                 else:
                     connection.execute(
                         """INSERT INTO crm_contacts(dataset,email,status,contact_id,verified_at,source)
@@ -758,7 +777,7 @@ def snapshot(dataset: str = "default") -> dict[str, Any]:
             orders.append(item)
         customers = [dict(row) for row in connection.execute("SELECT * FROM customers WHERE dataset=? ORDER BY name", (dataset,))]
         contacts = {
-            row["email"]: dict(row)
+            normalize_email(row["email"]): dict(row)
             for row in connection.execute("SELECT * FROM crm_contacts WHERE dataset=?", (dataset,)).fetchall()
         }
         activities = {
@@ -791,7 +810,7 @@ def snapshot(dataset: str = "default") -> dict[str, Any]:
             group["attention_details"].append(f"Order #{order['id']}: {order['state']}")
     for key, group in groups.items():
         contact = contacts.get(key)
-        group["crm_contact_status"] = contact["status"] if contact else "UNKNOWN"
+        group["crm_contact_status"] = contact["status"] if contact else "NOT_CHECKED"
         group["crm_contact_id"] = contact["contact_id"] if contact else None
         group["crm_contact_verified_at"] = contact["verified_at"] if contact else None
         group["last_activity"] = activities.get(key)
@@ -799,7 +818,8 @@ def snapshot(dataset: str = "default") -> dict[str, Any]:
     contact_counts = {
         "FOUND": sum(group["crm_contact_status"] == "FOUND" for group in groups.values()),
         "NOT_FOUND": sum(group["crm_contact_status"] == "NOT_FOUND" for group in groups.values()),
-        "UNKNOWN": sum(group["crm_contact_status"] == "UNKNOWN" for group in groups.values()),
+        "NOT_CHECKED": sum(group["crm_contact_status"] == "NOT_CHECKED" for group in groups.values()),
+        "LOOKUP_ERROR": sum(group["crm_contact_status"] == "LOOKUP_ERROR" for group in groups.values()),
     }
     counts = {state: sum(o["state"] == state for o in orders) for state in STATES}
     return {"orders": orders, "customers": customers, "eligible_order_count": sum(o["state"] != "NOT_ELIGIBLE" for o in orders),

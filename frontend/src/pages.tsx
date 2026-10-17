@@ -756,9 +756,13 @@ export function CustomersPage({ data, onNavigate }: PageProps) {
                           <span className="contact-status-pill contact-missing-pill">
                             <XCircle size={13} /> Not found
                           </span>
+                        ) : customer.crm_contact_status === "LOOKUP_ERROR" ? (
+                          <span className="contact-status-pill contact-missing-pill">
+                            <AlertCircle size={13} /> Lookup error
+                          </span>
                         ) : (
                           <span className="contact-status-pill contact-unknown-pill">
-                            Unknown
+                            Not checked
                           </span>
                         )}
                       </td>

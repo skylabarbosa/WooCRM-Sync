@@ -31,7 +31,7 @@ export type CustomerGroup = {
   synced_count: number;
   attention_count: number;
   attention_details: string[];
-  crm_contact_status: "FOUND" | "NOT_FOUND" | "UNKNOWN";
+  crm_contact_status: "FOUND" | "NOT_FOUND" | "NOT_CHECKED" | "LOOKUP_ERROR";
   crm_contact_id: string | null;
   crm_contact_verified_at: string | null;
   last_activity: string | null;
@@ -55,7 +55,7 @@ export type Dashboard = {
   customers: Array<Record<string, unknown>>;
   eligible_order_count: number;
   eligible_customer_count: number;
-  contact_counts: { FOUND: number; NOT_FOUND: number; UNKNOWN: number };
+  contact_counts: { FOUND: number; NOT_FOUND: number; NOT_CHECKED: number; LOOKUP_ERROR: number };
   customer_attention_count: number;
   counts: Record<SyncState, number>;
   last_run: SyncRun | null;
