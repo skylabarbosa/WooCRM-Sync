@@ -1,4 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
 
 import pytest
 from app import main
@@ -125,3 +127,110 @@ def test_live_reconciliation_persists_successful_external_values(monkeypatch):
     assert crm["source"] == "hubspot"
     assert crm["environment"] == "live"
     assert event["outcome"] == "completed"
+
+
+def test_concurrent_live_replays_claim_one_order_before_crm_write(monkeypatch):
+    monkeypatch.setenv("INTEGRATION_MODE", "live")
+    monkeypatch.setenv("CRM_PROVIDER", "hubspot")
+    monkeypatch.setenv("CRM_WRITE_ENABLED", "true")
+    monkeypatch.setenv("WOOCOMMERCE_STORE_URL", "https://shop.example")
+    monkeypatch.setenv("WOOCOMMERCE_CONSUMER_KEY", "mock-key")
+    monkeypatch.setenv("WOOCOMMERCE_CONSUMER_SECRET", "mock-secret")
+    monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", "mock-token")
+    records = {}
+    write_started = threading.Event()
+    release_write = threading.Event()
+    writes = []
+
+    class FakeWooCommerce:
+        def list_orders(self):
+            return [NormalizedOrder("live-race-1", "race@example.test", "Race", 12, "USD", "processing", "2026-10-17T10:00:00Z")]
+
+        def test_connection(self):
+            return None
+
+    class SlowCRM:
+        def test_connection(self):
+            return None
+
+        def find_order(self, order_id):
+            return records.get(order_id)
+
+        def write_order(self, order, existing=None):
+            writes.append(order.id)
+            write_started.set()
+            release_write.wait(timeout=3)
+            records[order.id] = NormalizedCRMOrder(
+                order.id, "crm-race-1", order.customer_email, order.customer_name,
+                order.total, order.currency, order.status, "deal-race-1", "2026-10-17T10:01:00Z",
+            )
+            return records[order.id]
+
+    monkeypatch.setattr(main, "WooCommerceClient", FakeWooCommerce)
+    monkeypatch.setattr(main, "HubSpotCRMAdapter", SlowCRM)
+    assert client.post("/api/woocrm/reconcile").status_code == 200
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(client.post, "/api/woocrm/orders/live-race-1/replay")
+        assert write_started.wait(timeout=2)
+        second = executor.submit(client.post, "/api/woocrm/orders/live-race-1/replay")
+        second_response = second.result(timeout=2)
+        release_write.set()
+        first_response = first.result(timeout=3)
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 409
+    assert writes == ["live-race-1"]
+
+
+def test_slow_live_connector_does_not_hold_sqlite_write_transaction(monkeypatch):
+    monkeypatch.setenv("INTEGRATION_MODE", "live")
+    monkeypatch.setenv("CRM_PROVIDER", "hubspot")
+    monkeypatch.setenv("CRM_WRITE_ENABLED", "true")
+    monkeypatch.setenv("WOOCOMMERCE_STORE_URL", "https://shop.example")
+    monkeypatch.setenv("WOOCOMMERCE_CONSUMER_KEY", "mock-key")
+    monkeypatch.setenv("WOOCOMMERCE_CONSUMER_SECRET", "mock-secret")
+    monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", "mock-token")
+    write_started = threading.Event()
+    release_write = threading.Event()
+    records = {}
+
+    class FakeWooCommerce:
+        def list_orders(self):
+            return [NormalizedOrder("live-slow-1", "slow@example.test", "Slow", 13, "USD", "processing", "2026-10-17T10:00:00Z")]
+
+        def test_connection(self):
+            return None
+
+    class SlowCRM:
+        def test_connection(self):
+            return None
+
+        def find_order(self, order_id):
+            return records.get(order_id)
+
+        def write_order(self, order, existing=None):
+            write_started.set()
+            release_write.wait(timeout=3)
+            records[order.id] = NormalizedCRMOrder(
+                order.id, "crm-slow-1", order.customer_email, order.customer_name,
+                order.total, order.currency, order.status, "deal-slow-1", "2026-10-17T10:01:00Z",
+            )
+            return records[order.id]
+
+    monkeypatch.setattr(main, "WooCommerceClient", FakeWooCommerce)
+    monkeypatch.setattr(main, "HubSpotCRMAdapter", SlowCRM)
+    assert client.post("/api/woocrm/reconcile").status_code == 200
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        replay_future = executor.submit(client.post, "/api/woocrm/orders/live-slow-1/replay")
+        assert write_started.wait(timeout=2)
+        started = time.monotonic()
+        dashboard_response = client.get("/api/woocrm/dashboard")
+        elapsed = time.monotonic() - started
+        release_write.set()
+        replay_response = replay_future.result(timeout=3)
+
+    assert dashboard_response.status_code == 200
+    assert elapsed < 1
+    assert replay_response.status_code == 200

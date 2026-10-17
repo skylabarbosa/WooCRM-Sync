@@ -315,6 +315,17 @@ def _create_schema(connection: sqlite3.Connection) -> None:
           fingerprint TEXT NOT NULL, approved INTEGER NOT NULL DEFAULT 0,
           approval_actor TEXT, approval_at TEXT, outcome TEXT NOT NULL DEFAULT 'flagged'
         );
+        CREATE TABLE IF NOT EXISTS live_write_claims (
+          dataset TEXT NOT NULL,
+          order_id TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('in_progress', 'completed', 'failed', 'uncertain')),
+          message TEXT,
+          external_id TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (dataset, order_id)
+        );
         """
     )
     for table in ("orders", "crm_orders"):
@@ -397,6 +408,7 @@ def reset_data(connection: sqlite3.Connection) -> None:
     connection.execute("DELETE FROM sync_runs WHERE dataset='default'")
     connection.execute("DELETE FROM order_events WHERE dataset='default'")
     connection.execute("DELETE FROM risk_evaluations WHERE dataset='default'")
+    connection.execute("DELETE FROM live_write_claims WHERE dataset='default'")
     connection.execute("DELETE FROM risk_settings WHERE key LIKE 'demo_%'")
     orders = seed_orders()
     connection.executemany(
@@ -1259,7 +1271,7 @@ def find_order(connection: sqlite3.Connection, dataset: str, order_id: str) -> s
 
 def live_write_action(order_id: str, dataset: str, event_type: str, approval_id: int | None = None) -> dict[str, Any]:
     action_label = "Replay" if event_type == "replay" else "Mismatch correction"
-    with db(write=True) as connection:
+    with db() as connection:
         order = find_order(connection, dataset, order_id)
         if not order:
             raise HTTPException(404, "Order not found")
@@ -1282,36 +1294,125 @@ def live_write_action(order_id: str, dataset: str, event_type: str, approval_id:
         status = connector_status()
         if not status["configured"] or not status.get("field_mapping_configured", False):
             reason = "Live CRM writes are blocked until connector configuration and field mapping are verified"
-            record_event(connection, dataset, order_id, event_type, "blocked", f"{action_label} was not run.", error_message=reason)
-            connection.commit()
-            raise HTTPException(409, reason)
-        if not writes_enabled():
+            blocked_reason = reason
+            before = compared_values(order, crm)
+            current_order = dict(order)
+            current_crm = dict(crm) if crm else None
+            # The audit event is written below, after this read transaction closes.
+            pass
+        elif not writes_enabled():
             reason = "Live CRM writes are disabled; set CRM_WRITE_ENABLED=true only after verification"
-            record_event(connection, dataset, order_id, event_type, "blocked", f"{action_label} was not run.", error_message=reason)
-            connection.commit()
-            raise HTTPException(409, reason)
+            blocked_reason = reason
+            before = compared_values(order, crm)
+            current_order = dict(order)
+            current_crm = dict(crm) if crm else None
+            pass
+        else:
+            blocked_reason = None
+            before = compared_values(order, crm)
+            current_order = dict(order)
+            current_crm = dict(crm) if crm else None
+    if blocked_reason is not None:
+        with db(write=True) as connection:
+            record_event(connection, dataset, order_id, event_type, "blocked", f"{action_label} was not run.", error_message=blocked_reason)
+        raise HTTPException(409, blocked_reason)
 
-        before = compared_values(order, crm)
-        try:
-            woo = WooCommerceClient()
-            crm_adapter = HubSpotCRMAdapter()
-            woo.test_connection()
-            crm_adapter.test_connection()
-            external = crm_adapter.find_order(str(order["id"]))
-            if event_type == "mismatch_correction" and external is None:
-                raise ConnectorError("HubSpot", "Mismatch correction requires the existing CRM record to be found")
-            normalized = NormalizedOrder(
-                id=str(order["id"]),
-                customer_email=normalize_email(order["customer_email"]),
-                customer_name=order["customer_name"],
-                total=float(order["total"]),
-                currency=order["currency"],
-                status=order["status"],
-                created_at=order["created_at"],
-            )
-            enforce_risk_guard(connection, order, external, approval_id)
-            verified = crm_adapter.write_order(normalized, external)
+    try:
+        woo = WooCommerceClient()
+        crm_adapter = HubSpotCRMAdapter()
+        woo.test_connection()
+        crm_adapter.test_connection()
+        external = crm_adapter.find_order(str(order_id))
+        if event_type == "mismatch_correction" and external is None:
+            raise ConnectorError("HubSpot", "Mismatch correction requires the existing CRM record to be found")
+        normalized = NormalizedOrder(
+            id=str(current_order["id"]),
+            customer_email=normalize_email(current_order["customer_email"]),
+            customer_name=current_order["customer_name"],
+            total=float(current_order["total"]),
+            currency=current_order["currency"],
+            status=current_order["status"],
+            created_at=current_order["created_at"],
+        )
+    except (ConnectorError, ValueError) as exc:
+        message = _redact_secrets(f"{exc.source}: {exc}" if isinstance(exc, ConnectorError) else str(exc))
+        with db(write=True) as connection:
             checked = now()
+            connection.execute(
+                """INSERT INTO crm_orders(dataset,order_id,email,name,total,currency,status,order_status,
+                   error_message,updated_at,source,environment,last_checked_at)
+                   VALUES (?,?,?,?,?,?, 'ERROR',NULL,?,?, 'hubspot','live',?)
+                   ON CONFLICT(dataset,order_id) DO UPDATE SET status='ERROR',error_message=excluded.error_message,
+                   source='hubspot',environment='live',last_checked_at=excluded.last_checked_at""",
+                (dataset, order_id, normalize_email(current_order["customer_email"]), current_order["customer_name"],
+                 current_order["total"], current_order["currency"], message, checked, checked),
+            )
+            connection.execute(
+                """INSERT INTO live_write_claims(dataset,order_id,event_type,status,message,created_at,updated_at)
+                   VALUES (?,?,?,'failed',?,?,?) ON CONFLICT(dataset,order_id) DO UPDATE SET
+                   event_type=excluded.event_type,status='failed',message=excluded.message,updated_at=excluded.updated_at""",
+                (dataset, order_id, event_type, message, checked, checked),
+            )
+            record_event(connection, dataset, order_id, event_type, "failed", f"{action_label} was not verified.", error_message=message)
+        if isinstance(exc, ConnectorError):
+            raise connector_failure(exc, f"live {event_type}") from exc
+        raise HTTPException(502, f"{action_label} failed: {message}") from exc
+
+    try:
+        with db(write=True) as connection:
+            current = find_order(connection, dataset, order_id)
+            current_crm_row = connection.execute(
+                "SELECT * FROM crm_orders WHERE dataset=? AND order_id=?", (dataset, order_id)
+            ).fetchone()
+            if not current or order_state(current, current_crm_row) not in (
+                {"MISSING", "ERROR"} if event_type == "replay" else {"MISMATCH"}
+            ):
+                raise HTTPException(409, f"{action_label} is no longer allowed because the order state changed")
+            enforce_risk_guard(connection, current, external, approval_id)
+            claim = connection.execute(
+                "SELECT * FROM live_write_claims WHERE dataset=? AND order_id=?", (dataset, order_id)
+            ).fetchone()
+            if claim and claim["status"] in {"in_progress", "uncertain"}:
+                raise HTTPException(409, "A live CRM write for this order is already in progress or requires reconciliation")
+            if claim and claim["status"] == "completed":
+                return {"state": "SYNCED", "message": f"{action_label} was already completed for order {order_id}"}
+            timestamp = now()
+            connection.execute(
+                """INSERT INTO live_write_claims(dataset,order_id,event_type,status,created_at,updated_at)
+                   VALUES (?,?,?,'in_progress',?,?) ON CONFLICT(dataset,order_id) DO UPDATE SET
+                   event_type=excluded.event_type,status='in_progress',message=NULL,updated_at=excluded.updated_at""",
+                (dataset, order_id, event_type, timestamp, timestamp),
+            )
+            current_order = dict(current)
+            normalized = NormalizedOrder(
+                id=str(current["id"]),
+                customer_email=normalize_email(current["customer_email"]),
+                customer_name=current["customer_name"],
+                total=float(current["total"]),
+                currency=current["currency"],
+                status=current["status"],
+                created_at=current["created_at"],
+            )
+            before = compared_values(current, current_crm_row)
+    except RiskBlocked as exc:
+        with db(write=True) as connection:
+            record_event(connection, dataset, order_id, event_type, "blocked",
+                         f"{action_label} was not run because the risk guard blocked it.", error_message=str(exc))
+        raise HTTPException(409, {"message": str(exc), "evaluation_id": exc.evaluation_id, "evaluation": exc.evaluation})
+
+    write_started = False
+    try:
+        write_started = True
+        verified = crm_adapter.write_order(normalized, external)
+        checked_external = crm_adapter.find_order(str(order_id))
+        if checked_external is None:
+            raise ConnectorError("HubSpot", f"{action_label} completed but fresh verification found no CRM record")
+        if checked_external.external_id != verified.external_id:
+            raise ConnectorError("HubSpot", f"{action_label} verification returned a different CRM record")
+        with db(write=True) as connection:
+            current = find_order(connection, dataset, order_id)
+            if not current:
+                raise ConnectorError("SQLite", "WooCommerce order disappeared before live write persistence")
             connection.execute(
                 """INSERT INTO crm_orders(dataset,order_id,email,name,total,currency,status,order_status,
                    error_message,updated_at,source,environment,last_checked_at)
@@ -1320,46 +1421,42 @@ def live_write_action(order_id: str, dataset: str, event_type: str, approval_id:
                    total=excluded.total,currency=excluded.currency,status='SYNCED',order_status=excluded.order_status,
                    error_message=NULL,updated_at=excluded.updated_at,source='hubspot',environment='live',
                    last_checked_at=excluded.last_checked_at""",
-                (dataset, order["id"], verified.email, verified.name, verified.total, verified.currency,
-                 verified.order_status, verified.updated_at or checked, checked),
+                (dataset, order_id, checked_external.email, checked_external.name, checked_external.total,
+                 checked_external.currency, checked_external.order_status, checked_external.updated_at or now(), now()),
             )
-            after = connection.execute(
-                "SELECT * FROM crm_orders WHERE dataset=? AND order_id=?", (dataset, order["id"])
-            ).fetchone()
-            verified_state = order_state(order, after)
-            if verified_state != "SYNCED":
-                raise ConnectorError("HubSpot", f"{action_label} completed but verification returned {verified_state}")
-            record_event(
-                connection, dataset, order_id, event_type, "verified",
-                f"{action_label} completed and a fresh CRM lookup verified consistency.",
-                before_values=before, after_values=compared_values(order, after),
+            after = connection.execute("SELECT * FROM crm_orders WHERE dataset=? AND order_id=?", (dataset, order_id)).fetchone()
+            if order_state(current, after) != "SYNCED":
+                raise ConnectorError("SQLite", f"{action_label} completed but persisted verification returned {order_state(current, after)}")
+            timestamp = now()
+            connection.execute(
+                "UPDATE live_write_claims SET status='completed',message=?,external_id=?,updated_at=? WHERE dataset=? AND order_id=?",
+                (f"{action_label} completed and verified", checked_external.external_id, timestamp, dataset, order_id),
             )
-            return {"state": "SYNCED", "message": f"{action_label} completed for order {order_id} and verified"}
-        except RiskBlocked as exc:
-            record_event(
-                connection, dataset, order_id, event_type, "blocked",
-                f"{action_label} was not run because the risk guard blocked it.",
-                error_message=str(exc),
+            record_event(connection, dataset, order_id, event_type, "verified",
+                         f"{action_label} completed and a fresh CRM lookup verified consistency.",
+                         before_values=before, after_values=compared_values(current, after))
+        return {"state": "SYNCED", "message": f"{action_label} completed for order {order_id} and verified"}
+    except (ConnectorError, ValueError) as exc:
+        message = _redact_secrets(f"{exc.source}: {exc}" if isinstance(exc, ConnectorError) else str(exc))
+        with db(write=True) as connection:
+            status = "uncertain" if write_started else "failed"
+            connection.execute(
+                "UPDATE live_write_claims SET status=?,message=?,updated_at=? WHERE dataset=? AND order_id=?",
+                (status, message, now(), dataset, order_id),
             )
-            connection.commit()
-            raise HTTPException(409, {"message": str(exc), "evaluation_id": exc.evaluation_id, "evaluation": exc.evaluation})
-        except (ConnectorError, ValueError) as exc:
-            message = _redact_secrets(f"{exc.source}: {exc}" if isinstance(exc, ConnectorError) else str(exc))
-            checked = now()
             connection.execute(
                 """INSERT INTO crm_orders(dataset,order_id,email,name,total,currency,status,order_status,
                    error_message,updated_at,source,environment,last_checked_at)
                    VALUES (?,?,?,?,?,?, 'ERROR',NULL,?,?, 'hubspot','live',?)
                    ON CONFLICT(dataset,order_id) DO UPDATE SET status='ERROR',error_message=excluded.error_message,
                    source='hubspot',environment='live',last_checked_at=excluded.last_checked_at""",
-                (dataset, order["id"], normalize_email(order["customer_email"]), order["customer_name"],
-                 order["total"], order["currency"], message, checked, checked),
+                (dataset, order_id, normalize_email(current_order["customer_email"]), current_order["customer_name"],
+                 current_order["total"], current_order["currency"], message, now(), now()),
             )
             record_event(connection, dataset, order_id, event_type, "failed", f"{action_label} was not verified.", error_message=message)
-            connection.commit()
-            if isinstance(exc, ConnectorError):
-                raise connector_failure(exc, f"live {event_type}") from exc
-            raise HTTPException(502, f"{action_label} failed: {message}") from exc
+        if isinstance(exc, ConnectorError):
+            raise connector_failure(exc, f"live {event_type}") from exc
+        raise HTTPException(502, f"{action_label} failed: {message}") from exc
 
 
 @app.post("/api/woocrm/orders/{order_id}/replay")
