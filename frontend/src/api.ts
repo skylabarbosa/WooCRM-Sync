@@ -2,7 +2,7 @@ import type { Dashboard, DatasetInfo, ImportResult, IntegrationStatus, OrderEven
 
 export const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
-const API_KEY_STORAGE = "woocrm-api-key";
+const ACCESS_TOKEN_STORAGE = "woocrm-access-token";
 
 export class ApiError extends Error {
   constructor(public readonly status: number, message: string) {
@@ -10,19 +10,27 @@ export class ApiError extends Error {
   }
 }
 
-export function getApiKey(): string {
-  return sessionStorage.getItem(API_KEY_STORAGE) || "";
+export function getAccessToken(): string {
+  return sessionStorage.getItem(ACCESS_TOKEN_STORAGE) || "";
 }
 
-export function setApiKey(value: string): void {
-  if (value.trim()) sessionStorage.setItem(API_KEY_STORAGE, value.trim());
-  else sessionStorage.removeItem(API_KEY_STORAGE);
+export function setAccessToken(value: string): void {
+  if (value.trim()) sessionStorage.setItem(ACCESS_TOKEN_STORAGE, value.trim());
+  else sessionStorage.removeItem(ACCESS_TOKEN_STORAGE);
+}
+
+export async function login(username: string, password: string): Promise<{ access_token: string; role: string }> {
+  return request("/api/woocrm/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
 }
 
 async function request(path: string, init: RequestInit = {}): Promise<any> {
   const headers = new Headers(init.headers);
-  const key = getApiKey();
-  if (key) headers.set("X-API-Key", key);
+  const token = getAccessToken();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
   const response = await fetch(`${API}${path}`, { ...init, headers });
   const result = await response.json().catch(() => null);
   if (!response.ok) {
