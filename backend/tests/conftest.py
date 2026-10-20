@@ -1,6 +1,9 @@
 from pathlib import Path
+import os
 
 import pytest
+
+os.environ.setdefault("APP_ENV", "demo")
 
 
 def pytest_runtest_teardown(item):

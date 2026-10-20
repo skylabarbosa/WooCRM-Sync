@@ -88,25 +88,7 @@ export function DashboardPage({ data, refresh, busy, setBusy, notify, onNavigate
         </ConfirmDialog>
       )}
 
-      {/* -- Page heading -- */}
-      <div className="page-heading">
-        <div>
-          <h2>Dashboard</h2>
-          <p style={{ fontSize: 14, marginTop: 4, color: "var(--ink-2)", fontWeight: 500 }}>Keep orders and CRM records aligned</p>
-          <p style={{ fontSize: 12, marginTop: 4 }}>Explore your WooCommerce and CRM synchronization status and take action where needed.</p>
-        </div>
-      </div>
-
-      {/* -- Metric cards -- */}
-      <section className="metric-grid">
-        <MetricCard label="Eligible orders" value={eligible}         detail={`${data.orders.length} total in snapshot`} tone="eligible" onClick={() => onNavigate("/woocrm/orders")} />
-        <MetricCard label="Synced"          value={counts.SYNCED}    detail="Verified records"       tone="synced"   onClick={() => onNavigate("/woocrm/orders")} />
-        <MetricCard label="Missing"         value={counts.MISSING}   detail="Awaiting CRM record"    tone="missing"  onClick={() => onNavigate("/woocrm/orders")} />
-        <MetricCard label="Mismatched"      value={counts.MISMATCH}  detail="Need review"            tone="mismatch" onClick={() => onNavigate("/woocrm/orders")} />
-        <MetricCard label="Errors"          value={counts.ERROR}     detail="Recoverable failures"   tone="error"    onClick={() => onNavigate("/woocrm/orders")} />
-      </section>
-
-      {/* -- Attention alert -- */}
+      {/* -- Attention alert: surface the most important next step first -- */}
       {attention.length > 0 && (
         <div className="alert-banner">
           <div className="alert-banner-left">
@@ -127,6 +109,15 @@ export function DashboardPage({ data, refresh, busy, setBusy, notify, onNavigate
           </button>
         </div>
       )}
+
+      {/* -- Metric cards -- */}
+      <section className="metric-grid">
+        <MetricCard label="Eligible orders" value={eligible}         detail={`${data.orders.length} total in snapshot`} tone="eligible" onClick={() => onNavigate("/woocrm/orders")} />
+        <MetricCard label="Synced"          value={counts.SYNCED}    detail="Verified records"       tone="synced"   onClick={() => onNavigate("/woocrm/orders")} />
+        <MetricCard label="Missing"         value={counts.MISSING}   detail="Awaiting CRM record"    tone="missing"  onClick={() => onNavigate("/woocrm/orders")} />
+        <MetricCard label="Mismatched"      value={counts.MISMATCH}  detail="Need review"            tone="mismatch" onClick={() => onNavigate("/woocrm/orders")} />
+        <MetricCard label="Errors"          value={counts.ERROR}     detail="Recoverable failures"   tone="error"    onClick={() => onNavigate("/woocrm/orders")} />
+      </section>
 
       {/* -- Three-column grid -- */}
       <div className="dash-three-col">
@@ -619,7 +610,6 @@ export function CustomersPage({ data, onNavigate }: PageProps) {
           <ChevronRight size={13} className="breadcrumb-chevron" />
           <span className="breadcrumb-current">Customers</span>
         </div>
-        <h2 className="customer-page-title">Customers</h2>
         <p className="customer-page-subtitle">Groups are based on normalized billing email, not a guaranteed identity.</p>
       </div>
 

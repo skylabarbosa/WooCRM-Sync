@@ -70,6 +70,8 @@ def crm_provider() -> str:
 
 
 def writes_enabled() -> bool:
+    if os.getenv("APP_ENV", "").strip().lower() == "production":
+        return False
     return os.getenv("CRM_WRITE_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
 
 

@@ -12,11 +12,14 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +33,7 @@ from app.connectors import (
     NormalizedOrder,
     WooCommerceClient,
     connector_status,
+    connector_max_attempts,
     crm_provider,
     integration_mode,
     writes_enabled,
@@ -43,6 +47,12 @@ ORDER_STATUSES = {"pending", "processing", "on-hold", "completed", "cancelled", 
 CRM_STATUSES = {"SYNCED", "ERROR"}
 STATES = {"SYNCED", "MISSING", "MISMATCH", "ERROR", "NOT_ELIGIBLE"}
 ROLE_RANK = {"viewer": 1, "operator": 2, "admin": 3}
+MIN_AUTH_SECRET_BYTES = 32
+MIN_PASSWORD_ITERATIONS = 600_000
+LOGIN_WINDOW_SECONDS = 60
+LOGIN_FAILURE_LIMIT = 5
+_login_failures: dict[str, list[float]] = {}
+_login_failures_lock = threading.Lock()
 
 app = FastAPI(title="WooCRM Sync", version="0.3.0")
 logger = logging.getLogger(__name__)
@@ -62,7 +72,10 @@ def _is_true(value: str | None, *, default: bool = False) -> bool:
 
 
 def app_env() -> str:
-    return os.getenv("APP_ENV", "demo").strip().lower()
+    value = os.getenv("APP_ENV", "").lower()
+    if value not in {"demo", "production"}:
+        raise RuntimeError("APP_ENV must be explicitly set to demo or production")
+    return value
 
 
 def operator_name() -> str:
@@ -97,7 +110,7 @@ def configured_users() -> dict[str, dict[str, str]]:
 def verify_password(password: str, encoded: str) -> bool:
     try:
         algorithm, iterations, salt, expected = encoded.split("$", 3)
-        if algorithm != "pbkdf2_sha256":
+        if algorithm != "pbkdf2_sha256" or int(iterations) < MIN_PASSWORD_ITERATIONS:
             return False
         derived = hashlib.pbkdf2_hmac("sha256", password.encode(), base64.urlsafe_b64decode(salt.encode()), int(iterations))
         return secrets.compare_digest(derived, base64.urlsafe_b64decode(expected.encode()))
@@ -172,23 +185,72 @@ def connector_failure(exc: ConnectorError, operation: str) -> HTTPException:
 
 
 def validate_startup_config() -> None:
-    if app_env() == "production":
-        if not auth_token_secret():
+    environment = app_env()
+    mode = integration_mode()
+    provider = crm_provider()
+    if mode not in {"demo", "live"}:
+        raise RuntimeError("INTEGRATION_MODE must be demo or live")
+    if provider not in {"mock", "hubspot"}:
+        raise RuntimeError("CRM_PROVIDER must be mock or hubspot")
+    connector_max_attempts()
+    if environment == "production":
+        if mode != "live":
+            raise RuntimeError("INTEGRATION_MODE=live is required when APP_ENV=production")
+        if provider != "hubspot":
+            raise RuntimeError("CRM_PROVIDER=hubspot is required for production")
+        secret = auth_token_secret()
+        if not secret:
             raise RuntimeError("AUTH_TOKEN_SECRET is required when APP_ENV=production")
+        if len(secret.encode("utf-8")) < MIN_AUTH_SECRET_BYTES:
+            raise RuntimeError(
+                "AUTH_TOKEN_SECRET must contain at least 32 bytes when APP_ENV=production"
+            )
+        if not DATABASE_PATH.is_absolute():
+            raise RuntimeError("DATABASE_PATH must be an absolute persistent path in production")
+        if _is_true(os.getenv("CRM_WRITE_ENABLED")):
+            raise RuntimeError("CRM_WRITE_ENABLED must remain false for this deployment")
         configured_users()
+        required_connector_settings = (
+            "WOOCOMMERCE_STORE_URL",
+            "WOOCOMMERCE_CONSUMER_KEY",
+            "WOOCOMMERCE_CONSUMER_SECRET",
+            "HUBSPOT_ACCESS_TOKEN",
+        )
+        if any(not os.getenv(name, "").strip() for name in required_connector_settings):
+            raise RuntimeError("Production live connector credentials are incomplete")
+        if not all(hubspot_field_mapping().values()):
+            raise RuntimeError("HubSpot field mapping must not contain empty property names")
+
+
+def cors_origins() -> list[str]:
+    configured = [
+        origin.strip()
+        for origin in os.getenv("CORS_ORIGINS", "").split(",")
+        if origin.strip()
+    ]
+    if not configured:
+        configured = ["http://localhost:5173", "http://127.0.0.1:5173"]
+    if "*" in configured:
+        raise RuntimeError("CORS_ORIGINS must contain explicit trusted origins")
+    environment = app_env()
+    for origin in configured:
+        parsed = urlparse(origin)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.path not in {"", "/"}:
+            raise RuntimeError("CORS_ORIGINS entries must be absolute HTTP(S) origins")
+        if environment == "production" and parsed.scheme != "https":
+            raise RuntimeError("CORS_ORIGINS must use HTTPS in production")
+        if environment == "demo" and parsed.scheme == "http" and parsed.hostname not in {
+            "localhost", "127.0.0.1", "::1"
+        }:
+            raise RuntimeError("HTTP CORS origins are limited to local development hosts")
+    return configured
 
 
 validate_startup_config()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        origin.strip()
-        for origin in os.getenv(
-            "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
-        ).split(",")
-        if origin.strip()
-    ],
+    allow_origins=cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -198,7 +260,7 @@ app.add_middleware(
 @app.middleware("http")
 async def enforce_access_control(request: Request, call_next: Any) -> Any:
     public_paths = {"/api/woocrm/health", "/api/woocrm/ready", "/api/woocrm/auth/login"}
-    if app_env() == "production" and request.url.path not in public_paths and request.method != "OPTIONS":
+    if app_env() != "demo" and request.url.path not in public_paths and request.method != "OPTIONS":
         required_role = "viewer" if request.method in {"GET", "HEAD"} else "operator"
         if request.url.path == "/api/woocrm/reset":
             required_role = "admin"
@@ -206,7 +268,29 @@ async def enforce_access_control(request: Request, call_next: Any) -> Any:
         identity = token_identity(supplied) if scheme.lower() == "bearer" else None
         if identity is None or ROLE_RANK[identity[1]] < ROLE_RANK[required_role]:
             return JSONResponse(status_code=401 if identity is None else 403, content={"detail": "Authentication required" if identity is None else "Insufficient role"})
-    return await call_next(request)
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
+
+
+def login_is_rate_limited(client_key: str) -> bool:
+    cutoff = time.monotonic() - LOGIN_WINDOW_SECONDS
+    with _login_failures_lock:
+        failures = [stamp for stamp in _login_failures.get(client_key, []) if stamp > cutoff]
+        _login_failures[client_key] = failures
+        return len(failures) >= LOGIN_FAILURE_LIMIT
+
+
+def record_login_failure(client_key: str) -> None:
+    with _login_failures_lock:
+        _login_failures.setdefault(client_key, []).append(time.monotonic())
+
+
+def clear_login_failures(client_key: str) -> None:
+    with _login_failures_lock:
+        _login_failures.pop(client_key, None)
 
 
 @contextmanager
@@ -394,9 +478,12 @@ def init_db() -> None:
             )
         for table in migrated_tables:
             connection.execute(f"DROP TABLE legacy_{table}")
-        if connection.execute("SELECT COUNT(*) FROM orders WHERE dataset='default'").fetchone()[0] == 0:
+        if (
+            app_env() != "production"
+            and connection.execute("SELECT COUNT(*) FROM orders WHERE dataset='default'").fetchone()[0] == 0
+        ):
             reset_data(connection)
-        elif integration_mode() == "demo":
+        elif app_env() != "production" and integration_mode() == "demo":
             ensure_demo_contact_outcomes(connection)
 
 
@@ -1039,12 +1126,17 @@ def health() -> dict[str, str]:
 
 
 @app.post("/api/woocrm/auth/login")
-def login(payload: LoginPayload) -> dict[str, str]:
+def login(payload: LoginPayload, request: Request) -> dict[str, str]:
     if app_env() != "production":
         raise HTTPException(404, "Authentication is only enabled in production")
+    client_key = request.client.host if request.client else "unknown"
+    if login_is_rate_limited(client_key):
+        raise HTTPException(429, "Too many login attempts; try again later", headers={"Retry-After": "60"})
     user = configured_users().get(payload.username.strip())
     if not user or not verify_password(payload.password, user["password_hash"]):
+        record_login_failure(client_key)
         raise HTTPException(401, "Invalid credentials")
+    clear_login_failures(client_key)
     return {"access_token": issue_access_token(payload.username.strip(), user["role"]), "token_type": "bearer", "role": user["role"]}
 
 
@@ -1300,27 +1392,31 @@ def live_write_action(order_id: str, dataset: str, event_type: str, approval_id:
             connection.commit()
             raise HTTPException(409, reason)
 
-        status = connector_status()
-        if not status["configured"] or not status.get("field_mapping_configured", False):
-            reason = "Live CRM writes are blocked until connector configuration and field mapping are verified"
+        if app_env() == "production":
+            reason = "Live CRM writes are permanently disabled in production"
             blocked_reason = reason
             before = compared_values(order, crm)
             current_order = dict(order)
             current_crm = dict(crm) if crm else None
-            # The audit event is written below, after this read transaction closes.
-            pass
-        elif not writes_enabled():
-            reason = "Live CRM writes are disabled; set CRM_WRITE_ENABLED=true only after verification"
-            blocked_reason = reason
-            before = compared_values(order, crm)
-            current_order = dict(order)
-            current_crm = dict(crm) if crm else None
-            pass
         else:
-            blocked_reason = None
-            before = compared_values(order, crm)
-            current_order = dict(order)
-            current_crm = dict(crm) if crm else None
+            status = connector_status()
+            if not status["configured"] or not status.get("field_mapping_configured", False):
+                reason = "Live CRM writes are blocked until connector configuration and field mapping are verified"
+                blocked_reason = reason
+                before = compared_values(order, crm)
+                current_order = dict(order)
+                current_crm = dict(crm) if crm else None
+            elif not writes_enabled():
+                reason = "Live CRM writes are disabled; set CRM_WRITE_ENABLED=true only for non-production testing"
+                blocked_reason = reason
+                before = compared_values(order, crm)
+                current_order = dict(order)
+                current_crm = dict(crm) if crm else None
+            else:
+                blocked_reason = None
+                before = compared_values(order, crm)
+                current_order = dict(order)
+                current_crm = dict(crm) if crm else None
     if blocked_reason is not None:
         with db(write=True) as connection:
             record_event(connection, dataset, order_id, event_type, "blocked", f"{action_label} was not run.", error_message=blocked_reason)

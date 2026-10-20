@@ -11,7 +11,9 @@ venv/
 node_modules/
 dist/
 .pytest_cache/
+.pytest-tmp*/
 .coverage
 coverage/
+*.log
 *.tsbuildinfo
 .DS_Store

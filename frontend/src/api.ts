@@ -1,6 +1,7 @@
 import type { Dashboard, DatasetInfo, ImportResult, IntegrationStatus, OrderEvent, RiskEvaluation, RiskSettings } from "./types";
 
-export const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const configuredApiUrl = import.meta.env.VITE_API_URL?.trim().replace(/\/+$/, "");
+export const API = configuredApiUrl || (import.meta.env.DEV ? "http://localhost:8000" : "");
 
 const ACCESS_TOKEN_STORAGE = "woocrm-access-token";
 

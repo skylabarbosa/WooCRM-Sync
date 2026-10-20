@@ -107,6 +107,15 @@ export function MetricCard({
     <div
       className={`metric-card tone-${normalizedTone}`}
       onClick={onClick}
+      onKeyDown={onClick ? event => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onClick();
+        }
+      } : undefined}
+      role={onClick ? "button" : undefined}
+      tabIndex={onClick ? 0 : undefined}
+      aria-label={onClick ? `View ${label} orders` : undefined}
       style={onClick ? { cursor: "pointer" } : {}}
     >
       <div className={`metric-icon-box tone-${normalizedTone}`}>
@@ -184,24 +193,24 @@ export function DonutChart({
 
 function getReason(order: Order): string {
   if (order.state === "SYNCED") return "-";
-  if (order.state === "MISSING") return "CRM order not found";
+  if (order.state === "MISSING") return "Not found";
   if (order.state === "MISMATCH") {
     if (order.crm && order.currency !== order.crm.currency) {
-      return `Currency differs (${order.currency} → ${order.crm.currency})`;
+      return "Currency mismatch";
     }
     if (order.crm && Math.abs(order.total - order.crm.total) >= 0.01) {
-      return "Total differs";
+      return "Total mismatch";
     }
     if (order.crm && order.customer_email.trim().toLowerCase() !== order.crm.email.trim().toLowerCase()) {
-      return "Email differs";
+      return "Email mismatch";
     }
-    return "Total differs";
+    return "Data mismatch";
   }
   if (order.state === "ERROR") {
-    return order.crm?.error_message || "Replay timed out";
+    return order.crm?.error_message ? "Sync failed" : "Timed out";
   }
   if (order.state === "NOT_ELIGIBLE") {
-    return "Excluded from sync";
+    return "Not eligible";
   }
   return "-";
 }
@@ -244,7 +253,7 @@ export function OrderTable({ orders, onSelect, onAction, busy }: {
             const isCrmError = order.state === "ERROR" || order.crm?.status?.toLowerCase() === "error";
 
             return (
-              <tr key={String(order.id)} onClick={() => onSelect(order)} className="clickable-row">
+              <tr key={String(order.id)} onClick={() => onSelect(order)} className={`clickable-row order-row--${order.state.toLowerCase()}`}>
                 <td>
                   <button className="link-button order-id-link" onClick={e => { e.stopPropagation(); onSelect(order); }}>
                     #{order.id}
@@ -330,7 +339,7 @@ export function DashboardOrderTable({ orders, onSelect, onAction, busy }: {
 }) {
   return (
     <div className="table-wrap">
-      <table>
+      <table className="dashboard-orders-table">
         <thead>
           <tr>
             <th>Order</th>
@@ -347,7 +356,7 @@ export function DashboardOrderTable({ orders, onSelect, onAction, busy }: {
           {orders.map(order => {
             const needsAttention = order.state !== "SYNCED" && order.state !== "NOT_ELIGIBLE";
             return (
-              <tr key={String(order.id)} onClick={() => onSelect(order)} className="clickable-row">
+              <tr key={String(order.id)} onClick={() => onSelect(order)} className={`clickable-row order-row--${order.state.toLowerCase()}`}>
                 <td>
                   <button className="link-button" onClick={e => { e.stopPropagation(); onSelect(order); }}>
                     #{order.id}
